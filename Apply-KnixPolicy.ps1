@@ -24,10 +24,6 @@
   Block | Allow. Persists to config.json and applies. Use "Allow" to re-enable OneDrive.
     .\Apply-KnixPolicy.ps1 -Mode Machine -OneDrive Allow
 
-.PARAMETER BitLocker
-  Enable | Disable. OFF by default. Enable encrypts the system drive (XTS-AES 256, TPM) ONLY if the device is
-  Entra- or AD-joined so the recovery key can be escrowed first; otherwise it skips and reports SKIPPED.
-
 .PARAMETER UsbWriteBlock
   Enable | Disable. OFF by default. Enable blocks writing to USB/removable disks (reading still works).
 
@@ -36,9 +32,10 @@
   capture any secret pasted into an RMM script (e.g. the Slack token). Enable only if no scripts carry secrets.
 
 .NOTES
-  Also enforced (see Get-MachinePolicies and the account/BitLocker functions): password length + lockout, Guest and
-  built-in Administrator disabled, firewall, Defender, Windows Update deadlines, SMBv1/LLMNR off, RDP NLA,
-  AutoRun off, UAC, and audit/log settings. Remove mode does NOT undo account policy, disabled accounts or BitLocker.
+  Also enforced (see Get-MachinePolicies and the account functions): password length + lockout, Guest and
+  built-in Administrator disabled, firewall, Windows Update deadlines, SMBv1/LLMNR off, RDP NLA,
+  AutoRun off, UAC, and audit/log settings. Remove mode does NOT undo account policy or disabled accounts.
+  Microsoft Defender is deliberately not managed. BitLocker is only CHECKED and reported, never changed.
   Config: C:\ProgramData\Knix\Policy\config.json (lock timeout, app list, taskbar unpin list, OneDrive switch, options above).
   Logs:   C:\ProgramData\Knix\Policy\policy.log (machine)  |  %LOCALAPPDATA%\Knix\policy-user.log (user)
   Exit code 0 = all steps succeeded, 1 = one or more steps failed (see log).
@@ -47,7 +44,6 @@
 param(
     [ValidateSet('Install', 'Machine', 'User', 'Remove')][string]$Mode = 'Install',
     [ValidateSet('Block', 'Allow')][string]$OneDrive,
-    [ValidateSet('Enable', 'Disable')][string]$BitLocker,
     [ValidateSet('Enable', 'Disable')][string]$UsbWriteBlock,
     [ValidateSet('Enable', 'Disable')][string]$PowerShellLogging
 )
@@ -136,8 +132,7 @@ function Get-DefaultConfig {
         UpdateGracePeriodDays     = 2
         # Disable the built-in Administrator, but only if another enabled admin exists.
         DisableBuiltinAdmin    = $true
-        # Opt-in options (off by default). Set with -BitLocker / -UsbWriteBlock / -PowerShellLogging Enable.
-        EnableBitLocker        = $false
+        # Opt-in options (off by default). Set with -UsbWriteBlock / -PowerShellLogging Enable.
         BlockUsbWrite          = $false
         PowerShellScriptBlockLogging = $false
     }
@@ -164,11 +159,10 @@ function Get-MachinePolicies {
     $od  = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\OneDrive'
     $od2 = 'HKLM:\SOFTWARE\Policies\Microsoft\OneDrive'
     $fw  = 'HKLM:\SOFTWARE\Policies\Microsoft\WindowsFirewall'
-    $wd  = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender'
     $wu  = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate'
     $sys = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System'
     # G = group (Base always enforced; OneDrive/Usb/PsLog are switchable), A = area name shown in the Slack report,
-    # K = keep on Remove, T = tolerate a write failure (report SKIPPED instead of FAILED)
+    # K = keep on Remove
     @(
         # 1. Fast Startup off (policy + live setting)
         @{ G = 'Base'; A = 'Fast Startup disabled'; P = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\System'; N = 'HiberbootEnabled'; V = 0 }
@@ -197,11 +191,6 @@ function Get-MachinePolicies {
         @{ G = 'Base'; A = 'Firewall on, inbound blocked (all profiles)'; P = "$fw\PrivateProfile";  N = 'DefaultInboundAction'; V = 1 }
         @{ G = 'Base'; A = 'Firewall on, inbound blocked (all profiles)'; P = "$fw\PublicProfile";   N = 'EnableFirewall'; V = 1 }
         @{ G = 'Base'; A = 'Firewall on, inbound blocked (all profiles)'; P = "$fw\PublicProfile";   N = 'DefaultInboundAction'; V = 1 }
-        # Defender: real-time + cloud protection + potentially-unwanted-app blocking
-        @{ G = 'Base'; A = 'Defender: real-time, cloud, PUA protection'; P = "$wd\Real-Time Protection"; N = 'DisableRealtimeMonitoring'; V = 0; T = $true }
-        @{ G = 'Base'; A = 'Defender: real-time, cloud, PUA protection'; P = "$wd\Spynet"; N = 'SpynetReporting'; V = 2; T = $true }
-        @{ G = 'Base'; A = 'Defender: real-time, cloud, PUA protection'; P = "$wd\Spynet"; N = 'SubmitSamplesConsent'; V = 1; T = $true }
-        @{ G = 'Base'; A = 'Defender: real-time, cloud, PUA protection'; P = $wd; N = 'PUAProtection'; V = 1; T = $true }
         # Windows Update: install automatically, forced deadlines, users cannot pause
         @{ G = 'Base'; A = 'Windows Update: auto-install, deadlines, no pause'; P = "$wu\AU"; N = 'NoAutoUpdate'; V = 0 }
         @{ G = 'Base'; A = 'Windows Update: auto-install, deadlines, no pause'; P = "$wu\AU"; N = 'AUOptions'; V = 4 }
@@ -253,15 +242,9 @@ function Set-MachinePolicies {
             if ($isOff) { $didChange = Remove-RegValue $e.P $e.N }
             else { $didChange = Set-RegValue $e.P $e.N $e.V }
         } catch {
-            if ($e.T) {
-                # Tolerated: e.g. Defender Tamper Protection blocks writes to its policy keys (it already enforces the setting).
-                Write-Log "Policy $($e.A) ($($e.N)) skipped: $($_.Exception.Message)" 'WARN'
-                if ($perArea[$e.A] -ne -1000) { Add-Result $e.A 'SKIPPED' 'write blocked (Tamper Protection?)' }
-            } else {
-                $script:Failures++
-                Write-Log "Policy $($e.A) ($($e.N)) FAILED: $($_.Exception.Message)" 'ERROR'
-                if ($perArea[$e.A] -ne -1000) { Add-Result $e.A 'FAILED' $_.Exception.Message }
-            }
+            $script:Failures++
+            Write-Log "Policy $($e.A) ($($e.N)) FAILED: $($_.Exception.Message)" 'ERROR'
+            if ($perArea[$e.A] -ne -1000) { Add-Result $e.A 'FAILED' $_.Exception.Message }
             $perArea[$e.A] = -1000
             continue
         }
@@ -446,47 +429,19 @@ function Disable-Smb1Feature {
     return $false
 }
 
-# ----------------------------------------------------------------------------- BitLocker (opt-in)
-# Never leaves a drive encrypted without a stored recovery key: if escrow fails, encryption is rolled back.
-function Set-BitLockerBaseline {
+# ----------------------------------------------------------------------------- BitLocker (report only)
+# BitLocker is managed elsewhere. This NEVER enables, disables or changes it, it only reports the state
+# so the Slack report shows whether each device is encrypted. A device that is not protected shows as FAILED
+# in the report (visibility only: it does not fail the run or change the exit code).
+function Test-BitLockerStatus {
     $area = 'BitLocker (system drive)'
-    if (-not $script:Cfg.EnableBitLocker) { Add-Result $area 'OK' 'off (opt-in, not enforced)'; return }
-    if (-not (Get-Command Get-BitLockerVolume -ErrorAction SilentlyContinue)) { Add-Result $area 'SKIPPED' 'BitLocker not available on this edition'; return }
-    $drive = $env:SystemDrive
-    $vol = Get-BitLockerVolume -MountPoint $drive -ErrorAction Stop
-    if ($vol.VolumeStatus -in @('FullyEncrypted', 'EncryptionInProgress')) {
-        if ($vol.ProtectionStatus -eq 'On') { Add-Result $area 'OK' "$($vol.VolumeStatus), $($vol.EncryptionMethod)" }
-        else { Add-Result $area 'SKIPPED' 'protection suspended (usually resumes after the next restart), check if it persists' }
-        return
-    }
-    if ($vol.VolumeStatus -ne 'FullyDecrypted') { Add-Result $area 'SKIPPED' "state: $($vol.VolumeStatus)"; return }
-
-    $tpm = Get-Tpm -ErrorAction SilentlyContinue
-    if (-not $tpm -or -not $tpm.TpmPresent -or -not $tpm.TpmReady) { Add-Result $area 'SKIPPED' 'no ready TPM'; return }
-    $entra = [bool](& dsregcmd.exe /status 2>$null | Select-String -Pattern 'AzureAdJoined\s*:\s*YES' -Quiet)
-    $ad    = [bool](Get-CimInstance Win32_ComputerSystem).PartOfDomain
-    if (-not $entra -and -not $ad) { Add-Result $area 'SKIPPED' 'not encrypted: no key escrow target (device is not Entra- or AD-joined)'; return }
-
-    Enable-BitLocker -MountPoint $drive -EncryptionMethod XtsAes256 -UsedSpaceOnly -TpmProtector -SkipHardwareTest | Out-Null
-    $vol = Get-BitLockerVolume -MountPoint $drive
-    $rp = $vol.KeyProtector | Where-Object KeyProtectorType -eq 'RecoveryPassword' | Select-Object -First 1
-    if (-not $rp) {
-        Add-BitLockerKeyProtector -MountPoint $drive -RecoveryPasswordProtector | Out-Null
-        $vol = Get-BitLockerVolume -MountPoint $drive
-        $rp = $vol.KeyProtector | Where-Object KeyProtectorType -eq 'RecoveryPassword' | Select-Object -First 1
-    }
-    $escrowed = $false
-    $err = ''
-    try {
-        if ($entra) { BackupToAAD-BitLockerKeyProtector -MountPoint $drive -KeyProtectorId $rp.KeyProtectorId | Out-Null; $escrowed = $true }
-        if ($ad)    { Backup-BitLockerKeyProtector -MountPoint $drive -KeyProtectorId $rp.KeyProtectorId | Out-Null; $escrowed = $true }
-    } catch { $err = $_.Exception.Message }
-    if (-not $escrowed) {
-        Disable-BitLocker -MountPoint $drive | Out-Null
-        throw "BitLocker rolled back, recovery key could not be escrowed: $err"
-    }
-    $target = @(); if ($entra) { $target += 'Entra ID' }; if ($ad) { $target += 'AD' }
-    Add-Result $area 'APPLIED' ('encrypting (XTS-AES 256), recovery key escrowed to ' + ($target -join ' + '))
+    if (-not (Get-Command Get-BitLockerVolume -ErrorAction SilentlyContinue)) { Add-Result $area 'FAILED' 'NOT AVAILABLE: BitLocker not present on this edition'; return }
+    $vol = Get-BitLockerVolume -MountPoint $env:SystemDrive -ErrorAction Stop
+    $detail = "$($vol.VolumeStatus), $($vol.EncryptionMethod), $($vol.EncryptionPercentage)%"
+    if ($vol.ProtectionStatus -eq 'On') { Add-Result $area 'OK' $detail; return }
+    if ($vol.VolumeStatus -eq 'EncryptionInProgress') { Add-Result $area 'OK' "encryption in progress ($($vol.EncryptionPercentage)%)"; return }
+    if ($vol.VolumeStatus -eq 'FullyEncrypted') { Add-Result $area 'FAILED' "NOT PROTECTED: encrypted but protection is suspended ($($vol.EncryptionMethod))"; return }
+    Add-Result $area 'FAILED' "NOT ENCRYPTED ($($vol.VolumeStatus))"
 }
 
 # ----------------------------------------------------------------------------- install / tasks
@@ -597,7 +552,6 @@ function Send-SlackReport {
 Import-Config
 $cfgDirty = $false
 if ($PSBoundParameters.ContainsKey('OneDrive'))         { $script:Cfg.AllowOneDrive = ($OneDrive -eq 'Allow'); $cfgDirty = $true }
-if ($PSBoundParameters.ContainsKey('BitLocker'))        { $script:Cfg.EnableBitLocker = ($BitLocker -eq 'Enable'); $cfgDirty = $true }
 if ($PSBoundParameters.ContainsKey('UsbWriteBlock'))    { $script:Cfg.BlockUsbWrite = ($UsbWriteBlock -eq 'Enable'); $cfgDirty = $true }
 if ($PSBoundParameters.ContainsKey('PowerShellLogging')) { $script:Cfg.PowerShellScriptBlockLogging = ($PowerShellLogging -eq 'Enable'); $cfgDirty = $true }
 if ($cfgDirty -and $Mode -ne 'User') { Save-Config; Write-Log 'Options saved to config.json' }
@@ -612,7 +566,7 @@ switch ($Mode) {
         Invoke-Step 'Built-in admin'   { Disable-BuiltinAdmin }
         Invoke-Step 'Audit policy'     { Set-AuditPolicy }
         Invoke-Step 'SMBv1 feature'    { if (Disable-Smb1Feature) { Add-Result 'SMBv1 feature removed' 'APPLIED' 'restart needed' } }
-        Invoke-Step 'BitLocker'        { Set-BitLockerBaseline }
+        Invoke-Step 'BitLocker'        { Test-BitLockerStatus }
         Invoke-Step 'Default profile'  { Set-DefaultUserHive }
         Invoke-Step 'Remove apps'      { Remove-UnwantedApps }
         Invoke-Step 'Run user task'    { Start-ScheduledTask -TaskPath $TaskPath -TaskName 'Knix Policy - User' }
@@ -623,7 +577,7 @@ switch ($Mode) {
         Invoke-Step 'Account policy'   { Set-AccountPolicy }
         Invoke-Step 'Built-in admin'   { Disable-BuiltinAdmin }
         Invoke-Step 'Audit policy'     { Set-AuditPolicy }
-        Invoke-Step 'BitLocker'        { Set-BitLockerBaseline }
+        Invoke-Step 'BitLocker'        { Test-BitLockerStatus }
         Invoke-Step 'Default profile'  { Set-DefaultUserHive }
         Invoke-Step 'Remove apps'      { Remove-UnwantedApps }
     }
@@ -642,7 +596,7 @@ switch ($Mode) {
         if (-not (Test-IsAdmin)) { Write-Log 'Must run elevated/SYSTEM' 'ERROR'; exit 1 }
         Invoke-Step 'Remove tasks'   { foreach ($t in 'Knix Policy - Machine', 'Knix Policy - User') { Unregister-ScheduledTask -TaskName $t -TaskPath $TaskPath -Confirm:$false -ErrorAction SilentlyContinue } }
         Invoke-Step 'Revert policy'  { Undo-MachinePolicies }
-        Write-Log 'Reverted registry policies. NOT undone: password/lockout policy, Guest and built-in Administrator state, BitLocker, per-user taskbar prefs, removed apps.'
+        Write-Log 'Reverted registry policies. NOT undone: password/lockout policy, Guest and built-in Administrator state, per-user taskbar prefs, removed apps.'
     }
 }
 

@@ -20,21 +20,20 @@ Deploys AppLocker in audit-only mode (blocks nothing) and collects what would ha
 
 ## Security baseline (always on)
 Password length 12+ and no forced expiry, lockout after 10 tries (15 min), Guest and built-in Administrator disabled
-(Administrator only if another enabled admin exists), firewall on / inbound blocked, Defender real-time + cloud + PUA,
-Windows Update auto-install with deadlines and no pause, SMBv1 / LLMNR off, RDP requires NLA, AutoRun off,
+(Administrator only if another enabled admin exists), firewall on / inbound blocked, Windows Update auto-install with deadlines and no pause, SMBv1 / LLMNR off, RDP requires NLA, AutoRun off,
 UAC secure-desktop consent, 200 MB Security log, command lines in process-creation events.
 - Password and lockout rules affect **local** accounts only. AD/Entra accounts follow the directory's policy.
-- Defender keys are skipped (reported SKIPPED) if Tamper Protection blocks the write.
+- Microsoft Defender is deliberately not managed.
+- BitLocker is **report only**: the Slack report shows whether the system drive is encrypted and protected. A device that is not
+  shows as a failed row. The script never enables, disables or changes BitLocker.
 - Tunables (deadline days, built-in admin) are in `C:\ProgramData\Knix\Policy\config.json`.
 
 ## Opt-in switches (off by default, saved on the device)
-Pass via `$ExtraArgs` in the Atera bootstrap, or run on a device: `... -Mode Machine -BitLocker Enable`
-- `-BitLocker Enable|Disable`: encrypts the system drive (XTS-AES 256, TPM). Only on Entra- or AD-joined devices, because the
-  recovery key is escrowed first. Otherwise it reports SKIPPED. If escrow fails, encryption is rolled back.
+Pass via `$ExtraArgs` in the Atera bootstrap, or run on a device: `... -Mode Machine -UsbWriteBlock Enable`
 - `-UsbWriteBlock Enable|Disable`: blocks writing to USB/removable disks.
 - `-PowerShellLogging Enable|Disable`: script-block logging. **Records script text, including any secret pasted into an RMM script.**
 
-`-Mode Remove` does not undo password/lockout policy, disabled accounts or BitLocker.
+`-Mode Remove` does not undo password/lockout policy or disabled accounts.
 
 ## Re-enable OneDrive
 Set `$OneDrive = 'Allow'` in the Atera bootstrap, or on a device:
