@@ -24,15 +24,32 @@
   Block | Allow. Persists to config.json and applies. Use "Allow" to re-enable OneDrive.
     .\Apply-KnixPolicy.ps1 -Mode Machine -OneDrive Allow
 
+.PARAMETER BitLocker
+  Enable | Disable. OFF by default. Enable encrypts the system drive (XTS-AES 256, TPM) ONLY if the device is
+  Entra- or AD-joined so the recovery key can be escrowed first; otherwise it skips and reports SKIPPED.
+
+.PARAMETER UsbWriteBlock
+  Enable | Disable. OFF by default. Enable blocks writing to USB/removable disks (reading still works).
+
+.PARAMETER PowerShellLogging
+  Enable | Disable. OFF by default. Script-block logging writes script text to the local event log, which would
+  capture any secret pasted into an RMM script (e.g. the Slack token). Enable only if no scripts carry secrets.
+
 .NOTES
-  Config: C:\ProgramData\Knix\Policy\config.json (lock timeout, app list, taskbar unpin list, OneDrive switch).
+  Also enforced (see Get-MachinePolicies and the account/BitLocker functions): password length + lockout, Guest and
+  built-in Administrator disabled, firewall, Defender, Windows Update deadlines, SMBv1/LLMNR off, RDP NLA,
+  AutoRun off, UAC, and audit/log settings. Remove mode does NOT undo account policy, disabled accounts or BitLocker.
+  Config: C:\ProgramData\Knix\Policy\config.json (lock timeout, app list, taskbar unpin list, OneDrive switch, options above).
   Logs:   C:\ProgramData\Knix\Policy\policy.log (machine)  |  %LOCALAPPDATA%\Knix\policy-user.log (user)
   Exit code 0 = all steps succeeded, 1 = one or more steps failed (see log).
 #>
 [CmdletBinding()]
 param(
     [ValidateSet('Install', 'Machine', 'User', 'Remove')][string]$Mode = 'Install',
-    [ValidateSet('Block', 'Allow')][string]$OneDrive
+    [ValidateSet('Block', 'Allow')][string]$OneDrive,
+    [ValidateSet('Enable', 'Disable')][string]$BitLocker,
+    [ValidateSet('Enable', 'Disable')][string]$UsbWriteBlock,
+    [ValidateSet('Enable', 'Disable')][string]$PowerShellLogging
 )
 
 $ErrorActionPreference = 'Stop'
@@ -113,6 +130,16 @@ function Get-DefaultConfig {
         )
         # Taskbar items to unpin at each user logon (display names, wildcards allowed).
         UnpinFromTaskbar       = @('Microsoft Store', 'Copilot')
+        # Windows Update install deadlines (days after an update is offered before it is forced).
+        QualityUpdateDeadlineDays = 7
+        FeatureUpdateDeadlineDays = 14
+        UpdateGracePeriodDays     = 2
+        # Disable the built-in Administrator, but only if another enabled admin exists.
+        DisableBuiltinAdmin    = $true
+        # Opt-in options (off by default). Set with -BitLocker / -UsbWriteBlock / -PowerShellLogging Enable.
+        EnableBitLocker        = $false
+        BlockUsbWrite          = $false
+        PowerShellScriptBlockLogging = $false
     }
 }
 
@@ -136,7 +163,12 @@ function Save-Config {
 function Get-MachinePolicies {
     $od  = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\OneDrive'
     $od2 = 'HKLM:\SOFTWARE\Policies\Microsoft\OneDrive'
-    # A = area name shown in the Slack report
+    $fw  = 'HKLM:\SOFTWARE\Policies\Microsoft\WindowsFirewall'
+    $wd  = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender'
+    $wu  = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate'
+    $sys = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System'
+    # G = group (Base always enforced; OneDrive/Usb/PsLog are switchable), A = area name shown in the Slack report,
+    # K = keep on Remove, T = tolerate a write failure (report SKIPPED instead of FAILED)
     @(
         # 1. Fast Startup off (policy + live setting)
         @{ G = 'Base'; A = 'Fast Startup disabled'; P = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\System'; N = 'HiberbootEnabled'; V = 0 }
@@ -156,6 +188,46 @@ function Get-MachinePolicies {
         @{ G = 'OneDrive'; A = 'OneDrive'; P = $od;  N = 'PreventNetworkTrafficPreUserSignIn'; V = 1 }
         @{ G = 'OneDrive'; A = 'OneDrive'; P = $od2; N = 'KFMBlockOptIn'; V = 1 }
         @{ G = 'OneDrive'; A = 'OneDrive'; P = $od2; N = 'DisablePersonalSync'; V = 1 }
+
+        # --- Security baseline -------------------------------------------------------------------
+        # Windows Firewall on for every profile, inbound blocked by default (same keys the Firewall GPO writes)
+        @{ G = 'Base'; A = 'Firewall on, inbound blocked (all profiles)'; P = "$fw\DomainProfile";   N = 'EnableFirewall'; V = 1 }
+        @{ G = 'Base'; A = 'Firewall on, inbound blocked (all profiles)'; P = "$fw\DomainProfile";   N = 'DefaultInboundAction'; V = 1 }
+        @{ G = 'Base'; A = 'Firewall on, inbound blocked (all profiles)'; P = "$fw\PrivateProfile";  N = 'EnableFirewall'; V = 1 }
+        @{ G = 'Base'; A = 'Firewall on, inbound blocked (all profiles)'; P = "$fw\PrivateProfile";  N = 'DefaultInboundAction'; V = 1 }
+        @{ G = 'Base'; A = 'Firewall on, inbound blocked (all profiles)'; P = "$fw\PublicProfile";   N = 'EnableFirewall'; V = 1 }
+        @{ G = 'Base'; A = 'Firewall on, inbound blocked (all profiles)'; P = "$fw\PublicProfile";   N = 'DefaultInboundAction'; V = 1 }
+        # Defender: real-time + cloud protection + potentially-unwanted-app blocking
+        @{ G = 'Base'; A = 'Defender: real-time, cloud, PUA protection'; P = "$wd\Real-Time Protection"; N = 'DisableRealtimeMonitoring'; V = 0; T = $true }
+        @{ G = 'Base'; A = 'Defender: real-time, cloud, PUA protection'; P = "$wd\Spynet"; N = 'SpynetReporting'; V = 2; T = $true }
+        @{ G = 'Base'; A = 'Defender: real-time, cloud, PUA protection'; P = "$wd\Spynet"; N = 'SubmitSamplesConsent'; V = 1; T = $true }
+        @{ G = 'Base'; A = 'Defender: real-time, cloud, PUA protection'; P = $wd; N = 'PUAProtection'; V = 1; T = $true }
+        # Windows Update: install automatically, forced deadlines, users cannot pause
+        @{ G = 'Base'; A = 'Windows Update: auto-install, deadlines, no pause'; P = "$wu\AU"; N = 'NoAutoUpdate'; V = 0 }
+        @{ G = 'Base'; A = 'Windows Update: auto-install, deadlines, no pause'; P = "$wu\AU"; N = 'AUOptions'; V = 4 }
+        @{ G = 'Base'; A = 'Windows Update: auto-install, deadlines, no pause'; P = $wu; N = 'ConfigureDeadlineForQualityUpdates'; V = [int]$script:Cfg.QualityUpdateDeadlineDays }
+        @{ G = 'Base'; A = 'Windows Update: auto-install, deadlines, no pause'; P = $wu; N = 'ConfigureDeadlineForFeatureUpdates'; V = [int]$script:Cfg.FeatureUpdateDeadlineDays }
+        @{ G = 'Base'; A = 'Windows Update: auto-install, deadlines, no pause'; P = $wu; N = 'ConfigureDeadlineGracePeriod'; V = [int]$script:Cfg.UpdateGracePeriodDays }
+        @{ G = 'Base'; A = 'Windows Update: auto-install, deadlines, no pause'; P = $wu; N = 'SetDisablePauseUXAccess'; V = 1 }
+        # Legacy / risky protocols
+        @{ G = 'Base'; A = 'SMBv1 server disabled'; P = 'HKLM:\SYSTEM\CurrentControlSet\Services\LanmanServer\Parameters'; N = 'SMB1'; V = 0 }
+        @{ G = 'Base'; A = 'LLMNR disabled'; P = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\DNSClient'; N = 'EnableMulticast'; V = 0 }
+        @{ G = 'Base'; A = 'RDP requires NLA'; P = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services'; N = 'UserAuthentication'; V = 1 }
+        # AutoRun / AutoPlay off
+        @{ G = 'Base'; A = 'AutoRun / AutoPlay disabled'; P = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Explorer'; N = 'NoDriveTypeAutoRun'; V = 255 }
+        @{ G = 'Base'; A = 'AutoRun / AutoPlay disabled'; P = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Explorer'; N = 'NoAutorun'; V = 1 }
+        @{ G = 'Base'; A = 'AutoRun / AutoPlay disabled'; P = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\Explorer'; N = 'NoAutoplayfornonVolume'; V = 1 }
+        # Optional: block writes to USB / removable disks (-UsbWriteBlock Enable)
+        @{ G = 'Usb'; A = 'USB storage write blocked'; P = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\RemovableStorageDevices\{53f5630d-b6bf-11d0-94f2-00a0c91efb8b}'; N = 'Deny_Write'; V = 1 }
+        # UAC: admin actions need consent on the secure desktop. K = keep on Remove (never turn UAC off).
+        @{ G = 'Base'; A = 'UAC: secure-desktop consent'; P = $sys; N = 'EnableLUA'; V = 1; K = $true }
+        @{ G = 'Base'; A = 'UAC: secure-desktop consent'; P = $sys; N = 'ConsentPromptBehaviorAdmin'; V = 2 }
+        @{ G = 'Base'; A = 'UAC: secure-desktop consent'; P = $sys; N = 'PromptOnSecureDesktop'; V = 1 }
+        # Logging: 200 MB Security log (value is KB) and command lines in process-creation events
+        @{ G = 'Base'; A = 'Security log 200 MB'; P = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\EventLog\Security'; N = 'MaxSize'; V = 204800 }
+        @{ G = 'Base'; A = 'Process command-line auditing'; P = "$sys\Audit"; N = 'ProcessCreationIncludeCmdLine_Enabled'; V = 1 }
+        # Optional: PowerShell script-block logging (-PowerShellLogging Enable). Off by default: it records script text.
+        @{ G = 'PsLog'; A = 'PowerShell script-block logging'; P = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\PowerShell\ScriptBlockLogging'; N = 'EnableScriptBlockLogging'; V = 1 }
     )
 }
 
@@ -165,16 +237,31 @@ $script:RevertSkip = @('HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\P
 function Set-MachinePolicies {
     $changed = 0
     $perArea = [ordered]@{}
+    $areaOff = @{}
+    # A switchable group is "off" when its policy values should be absent.
+    $groupOff = @{
+        OneDrive = [bool]$script:Cfg.AllowOneDrive
+        Usb      = -not [bool]$script:Cfg.BlockUsbWrite
+        PsLog    = -not [bool]$script:Cfg.PowerShellScriptBlockLogging
+    }
     foreach ($e in (Get-MachinePolicies)) {
         if (-not $perArea.Contains($e.A)) { $perArea[$e.A] = 0 }
+        $isOff = $groupOff.ContainsKey($e.G) -and $groupOff[$e.G]
+        $areaOff[$e.A] = $isOff
         $didChange = $false
         try {
-            if ($e.G -eq 'OneDrive' -and $script:Cfg.AllowOneDrive) { $didChange = Remove-RegValue $e.P $e.N }
+            if ($isOff) { $didChange = Remove-RegValue $e.P $e.N }
             else { $didChange = Set-RegValue $e.P $e.N $e.V }
         } catch {
-            $script:Failures++
-            Write-Log "Policy $($e.A) ($($e.N)) FAILED: $($_.Exception.Message)" 'ERROR'
-            Add-Result $e.A 'FAILED' $_.Exception.Message
+            if ($e.T) {
+                # Tolerated: e.g. Defender Tamper Protection blocks writes to its policy keys (it already enforces the setting).
+                Write-Log "Policy $($e.A) ($($e.N)) skipped: $($_.Exception.Message)" 'WARN'
+                if ($perArea[$e.A] -ne -1000) { Add-Result $e.A 'SKIPPED' 'write blocked (Tamper Protection?)' }
+            } else {
+                $script:Failures++
+                Write-Log "Policy $($e.A) ($($e.N)) FAILED: $($_.Exception.Message)" 'ERROR'
+                if ($perArea[$e.A] -ne -1000) { Add-Result $e.A 'FAILED' $_.Exception.Message }
+            }
             $perArea[$e.A] = -1000
             continue
         }
@@ -184,6 +271,7 @@ function Set-MachinePolicies {
         if ($perArea[$a] -lt 0) { continue }   # failure already recorded
         $detail = ''
         if ($a -eq 'OneDrive') { $detail = if ($script:Cfg.AllowOneDrive) { 'ALLOWED (block policies removed)' } else { 'blocked (sync, auto-save, KFM, personal accounts)' } }
+        elseif ($areaOff[$a]) { $detail = 'off (opt-in, not enforced)' }
         Add-Result $a $(if ($perArea[$a] -gt 0) { 'APPLIED' } else { 'OK' }) $detail
     }
     Write-Log "Machine policy: $changed value(s) corrected" $(if ($changed) { 'DRIFT' } else { 'INFO' })
@@ -194,7 +282,7 @@ function Set-MachinePolicies {
 
 function Undo-MachinePolicies {
     foreach ($e in (Get-MachinePolicies)) {
-        if ($script:RevertSkip -contains $e.P) { continue }
+        if ($e.K -or ($script:RevertSkip -contains $e.P)) { continue }
         [void](Remove-RegValue $e.P $e.N)
     }
 }
@@ -261,6 +349,144 @@ function Remove-UnwantedApps {
     if ($errors.Count -gt 0) { Add-Result 'Xbox / WhatsApp removal' 'FAILED' ("could not remove: " + (($errors | Sort-Object -Unique) -join ', ')) }
     elseif ($removed.Count -gt 0) { Add-Result 'Xbox / WhatsApp removal' 'APPLIED' ("removed: " + (($removed | Sort-Object -Unique) -join ', ')) }
     else { Add-Result 'Xbox / WhatsApp removal' 'OK' 'not installed' }
+}
+
+# ----------------------------------------------------------------------------- accounts (local security policy)
+# Uses secedit so the INF keys are locale-independent. Only affects LOCAL accounts: on AD/Entra-joined
+# devices, domain password policy is set in the directory, not here.
+function Get-SeceditValues {
+    $tmp = [IO.Path]::GetTempFileName()
+    try {
+        & secedit.exe /export /cfg $tmp /areas SECURITYPOLICY /quiet | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw "secedit export failed ($LASTEXITCODE)" }
+        $vals = @{}
+        foreach ($l in (Get-Content -LiteralPath $tmp)) {
+            if ($l -match '^\s*(\w+)\s*=\s*(.+?)\s*$') { $vals[$Matches[1]] = $Matches[2] }
+        }
+        return $vals
+    }
+    finally { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue }
+}
+
+function Set-AccountPolicy {
+    $want = [ordered]@{
+        MinimumPasswordLength = '12'
+        MaximumPasswordAge    = '-1'     # -1 = passwords never expire (current NIST guidance: length over rotation)
+        LockoutBadCount       = '10'
+        ResetLockoutCount     = '15'     # minutes
+        LockoutDuration       = '15'     # minutes
+        EnableGuestAccount    = '0'
+    }
+    $cur = Get-SeceditValues
+    $drift = @($want.Keys | Where-Object { $cur[$_] -ne $want[$_] })
+    if ($drift.Count -gt 0) {
+        $inf = [IO.Path]::GetTempFileName()
+        $sdb = [IO.Path]::GetTempFileName()
+        try {
+            $lines = @('[Unicode]', 'Unicode=yes', '[Version]', 'signature="$CHICAGO$"', 'Revision=1', '[System Access]')
+            foreach ($k in $drift) { $lines += "$k = $($want[$k])" }
+            Set-Content -LiteralPath $inf -Value $lines -Encoding Unicode
+            Remove-Item -LiteralPath $sdb -Force    # secedit creates the database itself
+            & secedit.exe /configure /db $sdb /cfg $inf /areas SECURITYPOLICY /quiet | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw "secedit configure failed ($LASTEXITCODE)" }
+        }
+        finally { Remove-Item -LiteralPath $inf, $sdb -Force -ErrorAction SilentlyContinue }
+        Write-Log ('Account policy corrected: ' + ($drift -join ', ')) 'DRIFT'
+    }
+    $groups = [ordered]@{
+        'Password policy: 12+ chars, no forced expiry' = @('MinimumPasswordLength', 'MaximumPasswordAge')
+        'Account lockout: 10 attempts, 15 min'         = @('LockoutBadCount', 'ResetLockoutCount', 'LockoutDuration')
+        'Guest account disabled'                       = @('EnableGuestAccount')
+    }
+    foreach ($g in $groups.Keys) {
+        $hit = @($groups[$g] | Where-Object { $drift -contains $_ }).Count
+        Add-Result $g $(if ($hit -gt 0) { 'APPLIED' } else { 'OK' }) ''
+    }
+}
+
+# Disables the built-in Administrator, but never the last usable admin (so IT cannot be locked out).
+function Disable-BuiltinAdmin {
+    $area = 'Built-in Administrator disabled'
+    if (-not $script:Cfg.DisableBuiltinAdmin) { Add-Result $area 'OK' 'off (config)'; return }
+    $adm = Get-LocalUser | Where-Object { $_.SID.Value -like 'S-1-5-21-*-500' } | Select-Object -First 1
+    if (-not $adm) { Add-Result $area 'OK' 'account not found'; return }
+    if (-not $adm.Enabled) { Add-Result $area 'OK' ''; return }
+    try { $members = @(Get-LocalGroupMember -SID 'S-1-5-32-544' -ErrorAction Stop) }
+    catch { Add-Result $area 'SKIPPED' 'could not list local admins, left enabled'; return }
+    $usable = 0
+    foreach ($m in $members) {
+        $sid = $m.SID.Value
+        if ($sid -eq $adm.SID.Value) { continue }
+        if ($m.ObjectClass -eq 'User' -and $m.PrincipalSource -eq 'Local') {
+            $lu = Get-LocalUser -SID $sid -ErrorAction SilentlyContinue
+            if ($lu -and $lu.Enabled) { $usable++ }
+        } else { $usable++ }    # domain / Entra user or group: assume it can administer the device
+    }
+    if ($usable -eq 0) { Add-Result $area 'SKIPPED' 'no other enabled admin exists, left enabled'; return }
+    Disable-LocalUser -SID $adm.SID
+    Write-Log 'Disabled the built-in Administrator account' 'DRIFT'
+    Add-Result $area 'APPLIED' ''
+}
+
+# ----------------------------------------------------------------------------- audit + legacy protocols
+function Set-AuditPolicy {
+    # "Process Creation" success events (4688). The command line itself comes from the registry value in the policy table.
+    $guid = '{0CCE922B-69AE-11D9-BED3-505054503030}'
+    & auditpol.exe /set "/subcategory:$guid" /success:enable | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "auditpol failed ($LASTEXITCODE)" }
+}
+
+function Disable-Smb1Feature {
+    $f = Get-WindowsOptionalFeature -Online -FeatureName SMB1Protocol -ErrorAction SilentlyContinue
+    if ($f -and $f.State -eq 'Enabled') {
+        Disable-WindowsOptionalFeature -Online -FeatureName SMB1Protocol -NoRestart -ErrorAction Stop | Out-Null
+        Write-Log 'Removed the SMB1Protocol Windows feature (restart needed)' 'DRIFT'
+        return $true
+    }
+    return $false
+}
+
+# ----------------------------------------------------------------------------- BitLocker (opt-in)
+# Never leaves a drive encrypted without a stored recovery key: if escrow fails, encryption is rolled back.
+function Set-BitLockerBaseline {
+    $area = 'BitLocker (system drive)'
+    if (-not $script:Cfg.EnableBitLocker) { Add-Result $area 'OK' 'off (opt-in, not enforced)'; return }
+    if (-not (Get-Command Get-BitLockerVolume -ErrorAction SilentlyContinue)) { Add-Result $area 'SKIPPED' 'BitLocker not available on this edition'; return }
+    $drive = $env:SystemDrive
+    $vol = Get-BitLockerVolume -MountPoint $drive -ErrorAction Stop
+    if ($vol.VolumeStatus -in @('FullyEncrypted', 'EncryptionInProgress')) {
+        if ($vol.ProtectionStatus -eq 'On') { Add-Result $area 'OK' "$($vol.VolumeStatus), $($vol.EncryptionMethod)" }
+        else { Add-Result $area 'SKIPPED' 'protection suspended (usually resumes after the next restart), check if it persists' }
+        return
+    }
+    if ($vol.VolumeStatus -ne 'FullyDecrypted') { Add-Result $area 'SKIPPED' "state: $($vol.VolumeStatus)"; return }
+
+    $tpm = Get-Tpm -ErrorAction SilentlyContinue
+    if (-not $tpm -or -not $tpm.TpmPresent -or -not $tpm.TpmReady) { Add-Result $area 'SKIPPED' 'no ready TPM'; return }
+    $entra = [bool](& dsregcmd.exe /status 2>$null | Select-String -Pattern 'AzureAdJoined\s*:\s*YES' -Quiet)
+    $ad    = [bool](Get-CimInstance Win32_ComputerSystem).PartOfDomain
+    if (-not $entra -and -not $ad) { Add-Result $area 'SKIPPED' 'not encrypted: no key escrow target (device is not Entra- or AD-joined)'; return }
+
+    Enable-BitLocker -MountPoint $drive -EncryptionMethod XtsAes256 -UsedSpaceOnly -TpmProtector -SkipHardwareTest | Out-Null
+    $vol = Get-BitLockerVolume -MountPoint $drive
+    $rp = $vol.KeyProtector | Where-Object KeyProtectorType -eq 'RecoveryPassword' | Select-Object -First 1
+    if (-not $rp) {
+        Add-BitLockerKeyProtector -MountPoint $drive -RecoveryPasswordProtector | Out-Null
+        $vol = Get-BitLockerVolume -MountPoint $drive
+        $rp = $vol.KeyProtector | Where-Object KeyProtectorType -eq 'RecoveryPassword' | Select-Object -First 1
+    }
+    $escrowed = $false
+    $err = ''
+    try {
+        if ($entra) { BackupToAAD-BitLockerKeyProtector -MountPoint $drive -KeyProtectorId $rp.KeyProtectorId | Out-Null; $escrowed = $true }
+        if ($ad)    { Backup-BitLockerKeyProtector -MountPoint $drive -KeyProtectorId $rp.KeyProtectorId | Out-Null; $escrowed = $true }
+    } catch { $err = $_.Exception.Message }
+    if (-not $escrowed) {
+        Disable-BitLocker -MountPoint $drive | Out-Null
+        throw "BitLocker rolled back, recovery key could not be escrowed: $err"
+    }
+    $target = @(); if ($entra) { $target += 'Entra ID' }; if ($ad) { $target += 'AD' }
+    Add-Result $area 'APPLIED' ('encrypting (XTS-AES 256), recovery key escrowed to ' + ($target -join ' + '))
 }
 
 # ----------------------------------------------------------------------------- install / tasks
@@ -341,7 +567,7 @@ function Send-SlackReport {
     $channel = "$($env:KNIX_SLACK_CHANNEL)".Trim()
     if (-not $token -or -not $channel) { Write-Log 'No Slack token/channel in environment, report not posted'; return }
 
-    $icon = @{ OK = ':white_check_mark:'; APPLIED = ':hammer_and_wrench:'; FAILED = ':x:' }
+    $icon = @{ OK = ':white_check_mark:'; APPLIED = ':hammer_and_wrench:'; FAILED = ':x:'; SKIPPED = ':fast_forward:' }
     $applied = @($script:Report | Where-Object Status -eq 'APPLIED').Count
     $failed  = @($script:Report | Where-Object Status -eq 'FAILED').Count
     $head = if ($failed) { ":warning: *Windows policy run on $($env:COMPUTERNAME): $failed FAILED*" }
@@ -369,10 +595,12 @@ function Send-SlackReport {
 
 # ============================================================================= main
 Import-Config
-if ($PSBoundParameters.ContainsKey('OneDrive')) {
-    $script:Cfg.AllowOneDrive = ($OneDrive -eq 'Allow')
-    if ($Mode -ne 'User') { Save-Config; Write-Log "OneDrive set to $OneDrive" }
-}
+$cfgDirty = $false
+if ($PSBoundParameters.ContainsKey('OneDrive'))         { $script:Cfg.AllowOneDrive = ($OneDrive -eq 'Allow'); $cfgDirty = $true }
+if ($PSBoundParameters.ContainsKey('BitLocker'))        { $script:Cfg.EnableBitLocker = ($BitLocker -eq 'Enable'); $cfgDirty = $true }
+if ($PSBoundParameters.ContainsKey('UsbWriteBlock'))    { $script:Cfg.BlockUsbWrite = ($UsbWriteBlock -eq 'Enable'); $cfgDirty = $true }
+if ($PSBoundParameters.ContainsKey('PowerShellLogging')) { $script:Cfg.PowerShellScriptBlockLogging = ($PowerShellLogging -eq 'Enable'); $cfgDirty = $true }
+if ($cfgDirty -and $Mode -ne 'User') { Save-Config; Write-Log 'Options saved to config.json' }
 
 switch ($Mode) {
     'Install' {
@@ -380,6 +608,11 @@ switch ($Mode) {
         Invoke-Step 'Install files'    { Install-Self }
         Invoke-Step 'Register tasks'   { Register-PolicyTasks }
         Invoke-Step 'Machine policy'   { Set-MachinePolicies }
+        Invoke-Step 'Account policy'   { Set-AccountPolicy }
+        Invoke-Step 'Built-in admin'   { Disable-BuiltinAdmin }
+        Invoke-Step 'Audit policy'     { Set-AuditPolicy }
+        Invoke-Step 'SMBv1 feature'    { if (Disable-Smb1Feature) { Add-Result 'SMBv1 feature removed' 'APPLIED' 'restart needed' } }
+        Invoke-Step 'BitLocker'        { Set-BitLockerBaseline }
         Invoke-Step 'Default profile'  { Set-DefaultUserHive }
         Invoke-Step 'Remove apps'      { Remove-UnwantedApps }
         Invoke-Step 'Run user task'    { Start-ScheduledTask -TaskPath $TaskPath -TaskName 'Knix Policy - User' }
@@ -387,6 +620,10 @@ switch ($Mode) {
     'Machine' {
         if (-not (Test-IsAdmin)) { Write-Log 'Must run elevated/SYSTEM' 'ERROR'; exit 1 }
         Invoke-Step 'Machine policy'   { Set-MachinePolicies }
+        Invoke-Step 'Account policy'   { Set-AccountPolicy }
+        Invoke-Step 'Built-in admin'   { Disable-BuiltinAdmin }
+        Invoke-Step 'Audit policy'     { Set-AuditPolicy }
+        Invoke-Step 'BitLocker'        { Set-BitLockerBaseline }
         Invoke-Step 'Default profile'  { Set-DefaultUserHive }
         Invoke-Step 'Remove apps'      { Remove-UnwantedApps }
     }
@@ -405,7 +642,7 @@ switch ($Mode) {
         if (-not (Test-IsAdmin)) { Write-Log 'Must run elevated/SYSTEM' 'ERROR'; exit 1 }
         Invoke-Step 'Remove tasks'   { foreach ($t in 'Knix Policy - Machine', 'Knix Policy - User') { Unregister-ScheduledTask -TaskName $t -TaskPath $TaskPath -Confirm:$false -ErrorAction SilentlyContinue } }
         Invoke-Step 'Revert policy'  { Undo-MachinePolicies }
-        Write-Log 'Reverted. Per-user taskbar prefs and removed apps are not restored.'
+        Write-Log 'Reverted registry policies. NOT undone: password/lockout policy, Guest and built-in Administrator state, BitLocker, per-user taskbar prefs, removed apps.'
     }
 }
 
