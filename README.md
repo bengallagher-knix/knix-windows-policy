@@ -12,6 +12,12 @@ as environment variables so the script can post a per-policy summary to Slack. N
 1. Run the Atera bootstrap on one pilot device first, as System. Check `C:\ProgramData\Knix\Policy\policy.log`.
 2. Then run on all devices and schedule it (weekly is enough).
 
+## AppLocker audit (`Apply-KnixAppLockerAudit.ps1`)
+Deploys AppLocker in audit-only mode (blocks nothing) and collects what would have been blocked.
+- `-Mode Install`: apply the audit policy. `-Mode Collect`: summarise new findings, write a CSV, post to Slack. `-Mode Remove`: undo.
+- Slack token/channel come from the Atera bootstrap's environment only. Nothing secret is stored here or on devices.
+- It refuses to run if other AppLocker rules exist (including the enforced browser block from `Apply-KnixPolicy.ps1`), and vice versa.
+
 ## Re-enable OneDrive
 Set `$OneDrive = 'Allow'` in the Atera bootstrap, or on a device:
 `powershell -File "C:\ProgramData\Knix\Policy\Apply-KnixPolicy.ps1" -Mode Machine -OneDrive Allow`
