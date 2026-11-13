@@ -263,20 +263,6 @@ function Remove-UnwantedApps {
     else { Add-Result 'Xbox / WhatsApp removal' 'OK' 'not installed' }
 }
 
-# One-time cleanup of the retired browser block. AppLocker is now managed separately, so this only
-# clears the old KNIX-* rules, and only when they are the ONLY rules present. Safe to delete later.
-function Remove-LegacyBrowserBlock {
-    $pol = Get-AppLockerPolicy -Local -ErrorAction SilentlyContinue
-    if (-not $pol) { return }
-    $names = @()
-    foreach ($c in $pol.RuleCollections) { foreach ($r in $c) { $names += $r.Name } }
-    if ($names.Count -eq 0 -or @($names | Where-Object { $_ -notlike 'KNIX-*' }).Count -gt 0) { return }
-    $tmp = Join-Path $env:TEMP 'knix-applocker-empty.xml'
-    Set-Content -LiteralPath $tmp -Value '<AppLockerPolicy Version="1"><RuleCollection Type="Exe" EnforcementMode="NotConfigured" /></AppLockerPolicy>' -Encoding UTF8
-    try { Set-AppLockerPolicy -XmlPolicy $tmp } finally { Remove-Item $tmp -Force -ErrorAction SilentlyContinue }
-    Write-Log 'Removed legacy KNIX browser-block AppLocker rules' 'DRIFT'
-}
-
 # ----------------------------------------------------------------------------- install / tasks
 function Install-Self {
     if (-not (Test-Path $Root)) { New-Item -ItemType Directory -Path $Root -Force | Out-Null }
@@ -396,7 +382,6 @@ switch ($Mode) {
         Invoke-Step 'Machine policy'   { Set-MachinePolicies }
         Invoke-Step 'Default profile'  { Set-DefaultUserHive }
         Invoke-Step 'Remove apps'      { Remove-UnwantedApps }
-        Invoke-Step 'Legacy cleanup'   { Remove-LegacyBrowserBlock }
         Invoke-Step 'Run user task'    { Start-ScheduledTask -TaskPath $TaskPath -TaskName 'Knix Policy - User' }
     }
     'Machine' {
@@ -404,7 +389,6 @@ switch ($Mode) {
         Invoke-Step 'Machine policy'   { Set-MachinePolicies }
         Invoke-Step 'Default profile'  { Set-DefaultUserHive }
         Invoke-Step 'Remove apps'      { Remove-UnwantedApps }
-        Invoke-Step 'Legacy cleanup'   { Remove-LegacyBrowserBlock }
     }
     'User' {
         $script:restartExplorer = $false

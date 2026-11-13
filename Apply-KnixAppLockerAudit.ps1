@@ -17,7 +17,7 @@
   still writes the local CSV and just skips Slack.
 
   NOTE: this replaces the LOCAL AppLocker policy. It refuses to run if rules that are not its own exist
-  (rules named KNIXAUDIT-*, or the retired KNIX-* browser block, are treated as its own and replaced).
+  (rules named KNIXAUDIT-* are treated as its own and replaced).
 
 .PARAMETER IncludeDll
   Also audit DLL loads. Very noisy and slower. Leave off for the first round.
@@ -71,7 +71,7 @@ function New-StableGuid([string]$Seed) {
 function Get-ForeignRuleCount {
     $count = 0
     $pol = Get-AppLockerPolicy -Local -ErrorAction SilentlyContinue
-    if ($pol) { foreach ($c in $pol.RuleCollections) { foreach ($r in $c) { if ($r.Name -notlike "$Prefix*" -and $r.Name -notlike 'KNIX-*') { $count++ } } } }
+    if ($pol) { foreach ($c in $pol.RuleCollections) { foreach ($r in $c) { if ($r.Name -notlike "$Prefix*") { $count++ } } } }
     return $count
 }
 
