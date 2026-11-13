@@ -24,6 +24,12 @@
   Block | Allow. Persists to config.json and applies. Use "Allow" to re-enable OneDrive.
     .\Apply-KnixPolicy.ps1 -Mode Machine -OneDrive Allow
 
+.PARAMETER TargetVersion
+  e.g. 25H2. Pins the Windows 11 feature update version (devices stay on it and keep getting its security patches).
+  None clears the pin. CAUTION: a pinned version that reaches end of servicing stops receiving security patches,
+  so raise the pin before then. Not pinned by default.
+    .\Apply-KnixPolicy.ps1 -Mode Machine -TargetVersion 25H2
+
 .PARAMETER UsbWriteBlock
   Enable | Disable. OFF by default. Enable blocks writing to USB/removable disks (reading still works).
 
@@ -44,6 +50,7 @@
 param(
     [ValidateSet('Install', 'Machine', 'User', 'Remove')][string]$Mode = 'Install',
     [ValidateSet('Block', 'Allow')][string]$OneDrive,
+    [ValidatePattern('^(\d{2}H[12]|None)$')][string]$TargetVersion,
     [ValidateSet('Enable', 'Disable')][string]$UsbWriteBlock,
     [ValidateSet('Enable', 'Disable')][string]$PowerShellLogging
 )
@@ -130,6 +137,10 @@ function Get-DefaultConfig {
         QualityUpdateDeadlineDays = 7
         FeatureUpdateDeadlineDays = 14
         UpdateGracePeriodDays     = 2
+        # Feature update pin, e.g. '25H2'. '' = not pinned. Set with -TargetVersion.
+        TargetFeatureVersion      = ''
+        # The Slack report flags the device if its newest installed quality update is older than this.
+        PatchMaxAgeDays           = 45
         # Disable the built-in Administrator, but only if another enabled admin exists.
         DisableBuiltinAdmin    = $true
         # Opt-in options (off by default). Set with -UsbWriteBlock / -PowerShellLogging Enable.
@@ -198,6 +209,10 @@ function Get-MachinePolicies {
         @{ G = 'Base'; A = 'Windows Update: auto-install, deadlines, no pause'; P = $wu; N = 'ConfigureDeadlineForFeatureUpdates'; V = [int]$script:Cfg.FeatureUpdateDeadlineDays }
         @{ G = 'Base'; A = 'Windows Update: auto-install, deadlines, no pause'; P = $wu; N = 'ConfigureDeadlineGracePeriod'; V = [int]$script:Cfg.UpdateGracePeriodDays }
         @{ G = 'Base'; A = 'Windows Update: auto-install, deadlines, no pause'; P = $wu; N = 'SetDisablePauseUXAccess'; V = 1 }
+        # Feature update pin (-TargetVersion). Y = registry value type. Group 'Pin' is removed when no version is set.
+        @{ G = 'Pin'; A = 'Feature update pinned'; P = $wu; N = 'TargetReleaseVersion'; V = 1 }
+        @{ G = 'Pin'; A = 'Feature update pinned'; P = $wu; N = 'ProductVersion'; V = 'Windows 11'; Y = 'String' }
+        @{ G = 'Pin'; A = 'Feature update pinned'; P = $wu; N = 'TargetReleaseVersionInfo'; V = [string]$script:Cfg.TargetFeatureVersion; Y = 'String' }
         # Legacy / risky protocols
         @{ G = 'Base'; A = 'SMBv1 server disabled'; P = 'HKLM:\SYSTEM\CurrentControlSet\Services\LanmanServer\Parameters'; N = 'SMB1'; V = 0 }
         @{ G = 'Base'; A = 'LLMNR disabled'; P = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\DNSClient'; N = 'EnableMulticast'; V = 0 }
@@ -230,6 +245,7 @@ function Set-MachinePolicies {
     # A switchable group is "off" when its policy values should be absent.
     $groupOff = @{
         OneDrive = [bool]$script:Cfg.AllowOneDrive
+        Pin      = [string]::IsNullOrEmpty([string]$script:Cfg.TargetFeatureVersion)
         Usb      = -not [bool]$script:Cfg.BlockUsbWrite
         PsLog    = -not [bool]$script:Cfg.PowerShellScriptBlockLogging
     }
@@ -240,7 +256,7 @@ function Set-MachinePolicies {
         $didChange = $false
         try {
             if ($isOff) { $didChange = Remove-RegValue $e.P $e.N }
-            else { $didChange = Set-RegValue $e.P $e.N $e.V }
+            else { $didChange = Set-RegValue $e.P $e.N $e.V $(if ($e.Y) { $e.Y } else { 'DWord' }) }
         } catch {
             $script:Failures++
             Write-Log "Policy $($e.A) ($($e.N)) FAILED: $($_.Exception.Message)" 'ERROR'
@@ -254,6 +270,7 @@ function Set-MachinePolicies {
         if ($perArea[$a] -lt 0) { continue }   # failure already recorded
         $detail = ''
         if ($a -eq 'OneDrive') { $detail = if ($script:Cfg.AllowOneDrive) { 'ALLOWED (block policies removed)' } else { 'blocked (sync, auto-save, KFM, personal accounts)' } }
+        elseif ($a -eq 'Feature update pinned' -and -not $areaOff[$a]) { $detail = "pinned to $($script:Cfg.TargetFeatureVersion)" }
         elseif ($areaOff[$a]) { $detail = 'off (opt-in, not enforced)' }
         Add-Result $a $(if ($perArea[$a] -gt 0) { 'APPLIED' } else { 'OK' }) $detail
     }
@@ -444,6 +461,44 @@ function Test-BitLockerStatus {
     Add-Result $area 'FAILED' "NOT ENCRYPTED ($($vol.VolumeStatus))"
 }
 
+# ----------------------------------------------------------------------------- version + patch status (report only)
+function Get-WindowsVersionRow {
+    $cv = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion'
+    $disp = if ($cv.DisplayVersion) { $cv.DisplayVersion } else { $cv.ReleaseId }
+    $name = if ([int]$cv.CurrentBuild -ge 22000) { 'Windows 11' } else { 'Windows 10' }
+    Add-Result 'Windows version' 'OK' "$name $disp, build $($cv.CurrentBuild).$($cv.UBR)"
+}
+
+# Reports how old the newest installed quality update is. Visibility only: it never fails the run.
+function Test-PatchStatus {
+    $area = 'Windows patch status'
+    $maxAge = [int]$script:Cfg.PatchMaxAgeDays
+    $last = $null
+    try {
+        $searcher = (New-Object -ComObject Microsoft.Update.Session).CreateUpdateSearcher()
+        $count = $searcher.GetTotalHistoryCount()
+        if ($count -gt 0) {
+            foreach ($h in $searcher.QueryHistory(0, [Math]::Min($count, 100))) {
+                if ($h.ResultCode -eq 2 -and $h.Title -match 'Cumulative Update|Security Update|Security Monthly Quality') {
+                    if (-not $last -or $h.Date -gt $last) { $last = $h.Date }
+                }
+            }
+        }
+    } catch { Write-Log "Update history unavailable: $($_.Exception.Message)" 'WARN' }
+
+    $pending = (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired') -or
+               (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending')
+    $boot = (Get-CimInstance Win32_OperatingSystem -ErrorAction SilentlyContinue).LastBootUpTime
+    $upDays = if ($boot) { [int]((Get-Date) - $boot).TotalDays } else { -1 }
+    $rb = if ($pending) { ", restart pending (up $upDays d)" } else { '' }
+
+    if (-not $last) { Add-Result $area 'SKIPPED' ('no quality update found in Windows Update history' + $rb); return }
+    $age = [int]((Get-Date) - $last).TotalDays
+    if ($age -gt $maxAge) { Add-Result $area 'FAILED' "last quality update $age days ago (limit $maxAge)$rb"; return }
+    if ($pending)         { Add-Result $area 'SKIPPED' "last quality update $age days ago$rb"; return }
+    Add-Result $area 'OK' "last quality update $age days ago"
+}
+
 # ----------------------------------------------------------------------------- install / tasks
 function Install-Self {
     if (-not (Test-Path $Root)) { New-Item -ItemType Directory -Path $Root -Force | Out-Null }
@@ -552,6 +607,7 @@ function Send-SlackReport {
 Import-Config
 $cfgDirty = $false
 if ($PSBoundParameters.ContainsKey('OneDrive'))         { $script:Cfg.AllowOneDrive = ($OneDrive -eq 'Allow'); $cfgDirty = $true }
+if ($PSBoundParameters.ContainsKey('TargetVersion'))    { $script:Cfg.TargetFeatureVersion = $(if ($TargetVersion -eq 'None') { '' } else { $TargetVersion }); $cfgDirty = $true }
 if ($PSBoundParameters.ContainsKey('UsbWriteBlock'))    { $script:Cfg.BlockUsbWrite = ($UsbWriteBlock -eq 'Enable'); $cfgDirty = $true }
 if ($PSBoundParameters.ContainsKey('PowerShellLogging')) { $script:Cfg.PowerShellScriptBlockLogging = ($PowerShellLogging -eq 'Enable'); $cfgDirty = $true }
 if ($cfgDirty -and $Mode -ne 'User') { Save-Config; Write-Log 'Options saved to config.json' }
@@ -567,6 +623,8 @@ switch ($Mode) {
         Invoke-Step 'Audit policy'     { Set-AuditPolicy }
         Invoke-Step 'SMBv1 feature'    { if (Disable-Smb1Feature) { Add-Result 'SMBv1 feature removed' 'APPLIED' 'restart needed' } }
         Invoke-Step 'BitLocker'        { Test-BitLockerStatus }
+        Invoke-Step 'Windows version'  { Get-WindowsVersionRow }
+        Invoke-Step 'Patch status'     { Test-PatchStatus }
         Invoke-Step 'Default profile'  { Set-DefaultUserHive }
         Invoke-Step 'Remove apps'      { Remove-UnwantedApps }
         Invoke-Step 'Run user task'    { Start-ScheduledTask -TaskPath $TaskPath -TaskName 'Knix Policy - User' }
@@ -578,6 +636,8 @@ switch ($Mode) {
         Invoke-Step 'Built-in admin'   { Disable-BuiltinAdmin }
         Invoke-Step 'Audit policy'     { Set-AuditPolicy }
         Invoke-Step 'BitLocker'        { Test-BitLockerStatus }
+        Invoke-Step 'Windows version'  { Get-WindowsVersionRow }
+        Invoke-Step 'Patch status'     { Test-PatchStatus }
         Invoke-Step 'Default profile'  { Set-DefaultUserHive }
         Invoke-Step 'Remove apps'      { Remove-UnwantedApps }
     }

@@ -23,6 +23,10 @@ Password length 12+ and no forced expiry, lockout after 10 tries (15 min), Guest
 (Administrator only if another enabled admin exists), firewall on / inbound blocked, Windows Update auto-install with deadlines and no pause, SMBv1 / LLMNR off, RDP requires NLA, AutoRun off,
 UAC secure-desktop consent, 200 MB Security log, command lines in process-creation events.
 - Password and lockout rules affect **local** accounts only. AD/Entra accounts follow the directory's policy.
+- The Slack report also shows the Windows version/build and a **patch status** row (days since the newest quality update,
+  restart pending). It flags a device older than `PatchMaxAgeDays` (45) as a failed row. Visibility only, never changes anything.
+- Optional feature-version pin: `-TargetVersion 25H2` (`None` clears it). Not pinned by default. **A pinned version that reaches
+  end of servicing stops getting security patches**, so raise it before then.
 - Microsoft Defender is deliberately not managed.
 - BitLocker is **report only**: the Slack report shows whether the system drive is encrypted and protected. A device that is not
   shows as a failed row. The script never enables, disables or changes BitLocker.
