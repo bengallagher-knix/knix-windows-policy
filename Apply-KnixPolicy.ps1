@@ -42,6 +42,7 @@ $ConfigPath = Join-Path $Root 'config.json'
 $StatePath  = Join-Path $Root 'applocker.state'
 $TaskPath   = '\Knix\'
 $script:Failures = 0
+$script:Report = New-Object System.Collections.ArrayList   # one row per policy area, posted to Slack at the end
 
 if ($Mode -eq 'User') {
     $LogDir = Join-Path $env:LOCALAPPDATA 'Knix'
@@ -62,9 +63,18 @@ function Write-Log([string]$Msg, [string]$Level = 'INFO') {
     } catch { }
 }
 
+# Status: OK (already compliant), APPLIED (changed this run), FAILED
+function Add-Result([string]$Area, [string]$Status, [string]$Detail = '') {
+    [void]$script:Report.Add([pscustomobject]@{ Area = $Area; Status = $Status; Detail = $Detail })
+}
+
 function Invoke-Step([string]$Name, [scriptblock]$Body) {
     try { & $Body }
-    catch { $script:Failures++; Write-Log "$Name FAILED: $($_.Exception.Message)" 'ERROR' }
+    catch {
+        $script:Failures++
+        Write-Log "$Name FAILED: $($_.Exception.Message)" 'ERROR'
+        Add-Result $Name 'FAILED' $_.Exception.Message
+    }
 }
 
 function Test-IsAdmin {
@@ -133,25 +143,26 @@ function Save-Config {
 function Get-MachinePolicies {
     $od  = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\OneDrive'
     $od2 = 'HKLM:\SOFTWARE\Policies\Microsoft\OneDrive'
+    # A = area name shown in the Slack report
     @(
         # 1. Fast Startup off (policy + live setting)
-        @{ G = 'Base'; P = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\System'; N = 'HiberbootEnabled'; V = 0 }
-        @{ G = 'Base'; P = 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Power'; N = 'HiberbootEnabled'; V = 0 }
+        @{ G = 'Base'; A = 'Fast Startup disabled'; P = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\System'; N = 'HiberbootEnabled'; V = 0 }
+        @{ G = 'Base'; A = 'Fast Startup disabled'; P = 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Power'; N = 'HiberbootEnabled'; V = 0 }
         # 2. Lock after inactivity (Security Policy: "Interactive logon: Machine inactivity limit")
-        @{ G = 'Base'; P = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System'; N = 'InactivityTimeoutSecs'; V = [int]$script:Cfg.LockTimeoutSeconds }
+        @{ G = 'Base'; A = "Screen lock after $([int]$script:Cfg.LockTimeoutSeconds / 60) min"; P = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System'; N = 'InactivityTimeoutSecs'; V = [int]$script:Cfg.LockTimeoutSeconds }
         # 3. Taskbar search hidden, Widgets off, Copilot button off
-        @{ G = 'Base'; P = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\Windows Search'; N = 'SearchOnTaskbarMode'; V = 0 }
-        @{ G = 'Base'; P = 'HKLM:\SOFTWARE\Policies\Microsoft\Dsh'; N = 'AllowNewsAndInterests'; V = 0 }
-        @{ G = 'Base'; P = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsCopilot'; N = 'TurnOffWindowsCopilot'; V = 1 }
+        @{ G = 'Base'; A = 'Taskbar search hidden'; P = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\Windows Search'; N = 'SearchOnTaskbarMode'; V = 0 }
+        @{ G = 'Base'; A = 'Widgets disabled'; P = 'HKLM:\SOFTWARE\Policies\Microsoft\Dsh'; N = 'AllowNewsAndInterests'; V = 0 }
+        @{ G = 'Base'; A = 'Copilot button disabled'; P = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsCopilot'; N = 'TurnOffWindowsCopilot'; V = 1 }
         # 5. Game Bar off (stops the "get an app for ms-gamingoverlay" popup once Xbox apps are removed)
-        @{ G = 'Base'; P = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\GameDVR'; N = 'AllowGameDVR'; V = 0 }
+        @{ G = 'Base'; A = 'Game Bar disabled'; P = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\GameDVR'; N = 'AllowGameDVR'; V = 0 }
         # 4. OneDrive off. Group 'OneDrive' is removed (not set) when AllowOneDrive = true.
-        @{ G = 'OneDrive'; P = $od;  N = 'DisableFileSyncNGSC'; V = 1 }
-        @{ G = 'OneDrive'; P = $od;  N = 'DisableFileSync'; V = 1 }
-        @{ G = 'OneDrive'; P = $od;  N = 'DisableLibrariesDefaultSaveToOneDrive'; V = 1 }
-        @{ G = 'OneDrive'; P = $od;  N = 'PreventNetworkTrafficPreUserSignIn'; V = 1 }
-        @{ G = 'OneDrive'; P = $od2; N = 'KFMBlockOptIn'; V = 1 }
-        @{ G = 'OneDrive'; P = $od2; N = 'DisablePersonalSync'; V = 1 }
+        @{ G = 'OneDrive'; A = 'OneDrive'; P = $od;  N = 'DisableFileSyncNGSC'; V = 1 }
+        @{ G = 'OneDrive'; A = 'OneDrive'; P = $od;  N = 'DisableFileSync'; V = 1 }
+        @{ G = 'OneDrive'; A = 'OneDrive'; P = $od;  N = 'DisableLibrariesDefaultSaveToOneDrive'; V = 1 }
+        @{ G = 'OneDrive'; A = 'OneDrive'; P = $od;  N = 'PreventNetworkTrafficPreUserSignIn'; V = 1 }
+        @{ G = 'OneDrive'; A = 'OneDrive'; P = $od2; N = 'KFMBlockOptIn'; V = 1 }
+        @{ G = 'OneDrive'; A = 'OneDrive'; P = $od2; N = 'DisablePersonalSync'; V = 1 }
     )
 }
 
@@ -160,12 +171,27 @@ $script:RevertSkip = @('HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\P
 
 function Set-MachinePolicies {
     $changed = 0
+    $perArea = [ordered]@{}
     foreach ($e in (Get-MachinePolicies)) {
-        if ($e.G -eq 'OneDrive' -and $script:Cfg.AllowOneDrive) {
-            if (Remove-RegValue $e.P $e.N) { $changed++ }
-        } else {
-            if (Set-RegValue $e.P $e.N $e.V) { $changed++ }
+        if (-not $perArea.Contains($e.A)) { $perArea[$e.A] = 0 }
+        $didChange = $false
+        try {
+            if ($e.G -eq 'OneDrive' -and $script:Cfg.AllowOneDrive) { $didChange = Remove-RegValue $e.P $e.N }
+            else { $didChange = Set-RegValue $e.P $e.N $e.V }
+        } catch {
+            $script:Failures++
+            Write-Log "Policy $($e.A) ($($e.N)) FAILED: $($_.Exception.Message)" 'ERROR'
+            Add-Result $e.A 'FAILED' $_.Exception.Message
+            $perArea[$e.A] = -1000
+            continue
         }
+        if ($didChange) { $changed++; $perArea[$e.A]++ }
+    }
+    foreach ($a in $perArea.Keys) {
+        if ($perArea[$a] -lt 0) { continue }   # failure already recorded
+        $detail = ''
+        if ($a -eq 'OneDrive') { $detail = if ($script:Cfg.AllowOneDrive) { 'ALLOWED (block policies removed)' } else { 'blocked (sync, auto-save, KFM, personal accounts)' } }
+        Add-Result $a $(if ($perArea[$a] -gt 0) { 'APPLIED' } else { 'OK' }) $detail
     }
     Write-Log "Machine policy: $changed value(s) corrected" $(if ($changed) { 'DRIFT' } else { 'INFO' })
     if ($changed -and -not $script:Cfg.AllowOneDrive) {
@@ -207,7 +233,11 @@ function Set-DefaultUserHive {
     if (-not (Test-Path $ntuser)) { Write-Log 'Default User hive not found, skipped' 'WARN'; return }
     & reg.exe load 'HKU\KnixDefault' $ntuser *> $null
     if ($LASTEXITCODE -ne 0) { Write-Log 'Could not load Default User hive, skipped' 'WARN'; return }
-    try { [void](Set-UserSettings 'Registry::HKEY_USERS\KnixDefault') }
+    try {
+        $chg = Set-UserSettings 'Registry::HKEY_USERS\KnixDefault'
+        # Per-user prefs on existing profiles are applied by the logon task, so SYSTEM can only report the template.
+        Add-Result 'Taskbar: Start left, no Task View/Search (new profiles)' $(if ($chg) { 'APPLIED' } else { 'OK' }) 'existing users enforced at logon'
+    }
     finally {
         [gc]::Collect(); [gc]::WaitForPendingFinalizers()
         for ($i = 0; $i -lt 5; $i++) {
@@ -221,18 +251,23 @@ function Set-DefaultUserHive {
 # ----------------------------------------------------------------------------- apps
 function Remove-UnwantedApps {
     $provisioned = @(Get-AppxProvisionedPackage -Online -ErrorAction SilentlyContinue)
+    $removed = New-Object System.Collections.ArrayList
+    $errors  = New-Object System.Collections.ArrayList
     foreach ($pattern in @($script:Cfg.RemoveApps)) {
         foreach ($pkg in @(Get-AppxPackage -AllUsers -Name $pattern -ErrorAction SilentlyContinue)) {
             Write-Log "Removing app $($pkg.PackageFullName)" 'DRIFT'
-            try { Remove-AppxPackage -Package $pkg.PackageFullName -AllUsers -ErrorAction Stop }
-            catch { $script:Failures++; Write-Log "Remove failed for $($pkg.Name): $($_.Exception.Message)" 'ERROR' }
+            try { Remove-AppxPackage -Package $pkg.PackageFullName -AllUsers -ErrorAction Stop; [void]$removed.Add($pkg.Name) }
+            catch { $script:Failures++; [void]$errors.Add($pkg.Name); Write-Log "Remove failed for $($pkg.Name): $($_.Exception.Message)" 'ERROR' }
         }
         foreach ($prov in ($provisioned | Where-Object { $_.DisplayName -like $pattern })) {
             Write-Log "Deprovisioning $($prov.DisplayName)" 'DRIFT'
-            try { Remove-AppxProvisionedPackage -Online -PackageName $prov.PackageName -ErrorAction Stop | Out-Null }
-            catch { $script:Failures++; Write-Log "Deprovision failed for $($prov.DisplayName): $($_.Exception.Message)" 'ERROR' }
+            try { Remove-AppxProvisionedPackage -Online -PackageName $prov.PackageName -ErrorAction Stop | Out-Null; [void]$removed.Add($prov.DisplayName) }
+            catch { $script:Failures++; [void]$errors.Add($prov.DisplayName); Write-Log "Deprovision failed for $($prov.DisplayName): $($_.Exception.Message)" 'ERROR' }
         }
     }
+    if ($errors.Count -gt 0) { Add-Result 'Xbox / WhatsApp removal' 'FAILED' ("could not remove: " + (($errors | Sort-Object -Unique) -join ', ')) }
+    elseif ($removed.Count -gt 0) { Add-Result 'Xbox / WhatsApp removal' 'APPLIED' ("removed: " + (($removed | Sort-Object -Unique) -join ', ')) }
+    else { Add-Result 'Xbox / WhatsApp removal' 'OK' 'not installed' }
 }
 
 # ----------------------------------------------------------------------------- AppLocker browser block
@@ -282,6 +317,7 @@ function Set-BrowserBlock {
     if ((Get-ForeignAppLockerRuleCount) -gt 0) {
         $script:Failures++
         Write-Log 'Existing non-Knix AppLocker rules found. Browser block NOT applied (would overwrite them). Merge manually.' 'ERROR'
+        Add-Result 'Browser block' 'FAILED' 'existing non-Knix AppLocker rules, not overwritten'
         return
     }
     $xml = Build-BrowserBlockXml
@@ -291,14 +327,18 @@ function Set-BrowserBlock {
     $have = 0
     if ($pol) { foreach ($c in $pol.RuleCollections) { foreach ($r in $c) { $have++ } } }
     $stored = if (Test-Path $StatePath) { (Get-Content $StatePath -Raw).Trim() } else { '' }
+    $applied = $false
     if ($stored -ne $hash -or $have -ne $expected) {
         $tmp = Join-Path $env:TEMP 'knix-applocker.xml'
         Set-Content -LiteralPath $tmp -Value $xml -Encoding UTF8
         try { Set-AppLockerPolicy -XmlPolicy $tmp } finally { Remove-Item $tmp -Force -ErrorAction SilentlyContinue }
         Set-Content -LiteralPath $StatePath -Value $hash
         Write-Log "AppLocker browser block applied ($expected rules)" 'DRIFT'
+        $applied = $true
     }
     Enable-AppIdService
+    $n = [int](($expected - 1) / 2)
+    Add-Result 'Browser block (only Chrome + Edge)' $(if ($applied) { 'APPLIED' } else { 'OK' }) "$n browsers denied via AppLocker"
 }
 
 function Remove-BrowserBlock {
@@ -369,6 +409,51 @@ function Remove-WhatsAppWin32 {
     }
 }
 
+# ----------------------------------------------------------------------------- reporting (Slack)
+# The Slack token and channel are NOT stored in this repo. The Atera bootstrap (which holds the secrets)
+# passes them in as environment variables KNIX_SLACK_TOKEN / KNIX_SLACK_CHANNEL for that single run.
+# Scheduled self-heal runs have no token, so they stay silent.
+function Save-Report {
+    $obj = [ordered]@{
+        Computer = $env:COMPUTERNAME
+        Time     = (Get-Date).ToString('s')
+        Failures = $script:Failures
+        Results  = @($script:Report)
+    }
+    $obj | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $Root 'last-run.json') -Encoding UTF8
+}
+
+function Send-SlackReport {
+    $token   = "$($env:KNIX_SLACK_TOKEN)".Trim()
+    $channel = "$($env:KNIX_SLACK_CHANNEL)".Trim()
+    if (-not $token -or -not $channel) { Write-Log 'No Slack token/channel in environment, report not posted'; return }
+
+    $icon = @{ OK = ':white_check_mark:'; APPLIED = ':hammer_and_wrench:'; FAILED = ':x:' }
+    $applied = @($script:Report | Where-Object Status -eq 'APPLIED').Count
+    $failed  = @($script:Report | Where-Object Status -eq 'FAILED').Count
+    $head = if ($failed) { ":warning: *Windows policy run on $($env:COMPUTERNAME): $failed FAILED*" }
+            elseif ($applied) { ":lock: *Windows policy applied on $($env:COMPUTERNAME)* ($applied changed)" }
+            else { ":white_check_mark: *Windows policy check on $($env:COMPUTERNAME): already compliant*" }
+
+    $os = (Get-CimInstance Win32_OperatingSystem -ErrorAction SilentlyContinue)
+    $lines = New-Object System.Collections.ArrayList
+    [void]$lines.Add($head)
+    foreach ($r in $script:Report) {
+        $d = if ($r.Detail) { " _($($r.Detail))_" } else { '' }
+        [void]$lines.Add("$($icon[$r.Status]) $($r.Area)$d")
+    }
+    if ($os) { [void]$lines.Add("_$($os.Caption) build $($os.BuildNumber) | $(Get-Date -Format 'yyyy-MM-dd HH:mm')_") }
+
+    $body  = @{ channel = $channel; text = ($lines -join "`n"); unfurl_links = $false } | ConvertTo-Json -Compress
+    $bytes = [Text.Encoding]::UTF8.GetBytes($body)
+    try {
+        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+        $resp = Invoke-RestMethod -Uri 'https://slack.com/api/chat.postMessage' -Method Post -Headers @{ Authorization = "Bearer $token" } `
+                 -ContentType 'application/json; charset=utf-8' -Body $bytes -UseBasicParsing -TimeoutSec 20
+        if ($resp.ok) { Write-Log 'Slack report posted' } else { Write-Log "Slack refused the report: $($resp.error)" 'WARN' }
+    } catch { Write-Log "Slack post failed: $($_.Exception.Message)" 'WARN' }   # never log the token
+}
+
 # ============================================================================= main
 Import-Config
 if ($PSBoundParameters.ContainsKey('OneDrive')) {
@@ -412,6 +497,11 @@ switch ($Mode) {
         Invoke-Step 'Revert AppLocker' { Remove-BrowserBlock }
         Write-Log 'Reverted. Per-user taskbar prefs and removed apps are not restored.'
     }
+}
+
+if ($Mode -in @('Install', 'Machine')) {
+    try { Save-Report } catch { Write-Log "Could not save report: $($_.Exception.Message)" 'WARN' }
+    if ($Mode -eq 'Install') { Send-SlackReport }
 }
 
 if ($script:Failures -gt 0) { Write-Log "Completed with $($script:Failures) failure(s)" 'ERROR'; exit 1 }
