@@ -16,9 +16,8 @@
   KNIX_SLACK_TOKEN / KNIX_SLACK_CHANNEL as environment variables for that one run. Without them the script
   still writes the local CSV and just skips Slack.
 
-  CONFLICT: this replaces the LOCAL AppLocker policy. It refuses to run if rules that are not its own exist
-  (including the enforced browser-block from Apply-KnixPolicy.ps1), and that script likewise refuses to run
-  over these audit rules. Use one or the other per device until you merge them into the final policy.
+  NOTE: this replaces the LOCAL AppLocker policy. It refuses to run if rules that are not its own exist
+  (rules named KNIXAUDIT-*, or the retired KNIX-* browser block, are treated as its own and replaced).
 
 .PARAMETER IncludeDll
   Also audit DLL loads. Very noisy and slower. Leave off for the first round.
@@ -72,7 +71,7 @@ function New-StableGuid([string]$Seed) {
 function Get-ForeignRuleCount {
     $count = 0
     $pol = Get-AppLockerPolicy -Local -ErrorAction SilentlyContinue
-    if ($pol) { foreach ($c in $pol.RuleCollections) { foreach ($r in $c) { if ($r.Name -notlike "$Prefix*") { $count++ } } } }
+    if ($pol) { foreach ($c in $pol.RuleCollections) { foreach ($r in $c) { if ($r.Name -notlike "$Prefix*" -and $r.Name -notlike 'KNIX-*') { $count++ } } } }
     return $count
 }
 
@@ -172,7 +171,7 @@ function Set-AuditLogs {
 
 function Install-Audit {
     if ((Get-ForeignRuleCount) -gt 0) {
-        throw 'Existing non-audit AppLocker rules found (for example the enforced browser block). Not overwriting them.'
+        throw 'Existing AppLocker rules that this script did not create were found. Not overwriting them.'
     }
     $xml = Build-AuditXml
     $tmp = Join-Path $env:TEMP 'knix-applocker-audit.xml'

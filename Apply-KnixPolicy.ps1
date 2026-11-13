@@ -5,11 +5,11 @@
 .DESCRIPTION
   Enforces a baseline using the same mechanism Group Policy uses: policy registry keys under
   HKLM\SOFTWARE\Policies (standard users cannot write HKLM, and Windows greys out the matching
-  Settings toggles as "managed by your organization"), plus AppLocker for the browser block.
+  Settings toggles as "managed by your organization"). AppLocker is NOT handled here.
 
   Self-heals: Install mode copies this script to C:\ProgramData\Knix\Policy (admin-only write) and
   registers two scheduled tasks that re-apply the baseline, so drift is corrected even if RMM is offline.
-    \Knix\Knix Policy - Machine   SYSTEM, at startup + hourly   (HKLM policy, app removal, AppLocker, Default User hive)
+    \Knix\Knix Policy - Machine   SYSTEM, at startup + hourly   (HKLM policy, app removal, Default User hive)
     \Knix\Knix Policy - User      Users group, at logon + hourly (taskbar prefs, unpin Store/Copilot, WhatsApp Win32)
 
   REQUIREMENTS: users must be standard users (not local admins). Windows 11, Windows PowerShell 5.1.
@@ -25,7 +25,7 @@
     .\Apply-KnixPolicy.ps1 -Mode Machine -OneDrive Allow
 
 .NOTES
-  Config: C:\ProgramData\Knix\Policy\config.json (lock timeout, app list, browser list, OneDrive switch).
+  Config: C:\ProgramData\Knix\Policy\config.json (lock timeout, app list, taskbar unpin list, OneDrive switch).
   Logs:   C:\ProgramData\Knix\Policy\policy.log (machine)  |  %LOCALAPPDATA%\Knix\policy-user.log (user)
   Exit code 0 = all steps succeeded, 1 = one or more steps failed (see log).
 #>
@@ -39,7 +39,6 @@ $ErrorActionPreference = 'Stop'
 $Root       = Join-Path $env:ProgramData 'Knix\Policy'
 $ScriptPath = Join-Path $Root 'Apply-KnixPolicy.ps1'
 $ConfigPath = Join-Path $Root 'config.json'
-$StatePath  = Join-Path $Root 'applocker.state'
 $TaskPath   = '\Knix\'
 $script:Failures = 0
 $script:Report = New-Object System.Collections.ArrayList   # one row per policy area, posted to Slack at the end
@@ -114,12 +113,6 @@ function Get-DefaultConfig {
         )
         # Taskbar items to unpin at each user logon (display names, wildcards allowed).
         UnpinFromTaskbar       = @('Microsoft Store', 'Copilot')
-        # Original executable names blocked by AppLocker. Chrome and Edge are never blocked.
-        BlockedBrowserBinaries = @(
-            'firefox.exe', 'brave.exe', 'opera.exe', 'vivaldi.exe', 'iexplore.exe', 'chromium.exe',
-            'waterfox.exe', 'librewolf.exe', 'palemoon.exe', 'seamonkey.exe', 'maxthon.exe', 'arc.exe',
-            'duckduckgo.exe', 'comet.exe', 'avastbrowser.exe', 'torch.exe', 'ucbrowser.exe'
-        )
     }
 }
 
@@ -270,84 +263,18 @@ function Remove-UnwantedApps {
     else { Add-Result 'Xbox / WhatsApp removal' 'OK' 'not installed' }
 }
 
-# ----------------------------------------------------------------------------- AppLocker browser block
-function New-StableGuid([string]$Seed) {
-    $md5 = [Security.Cryptography.MD5]::Create()
-    ([guid]::new($md5.ComputeHash([Text.Encoding]::UTF8.GetBytes($Seed)))).ToString()
-}
-
-function Get-ForeignAppLockerRuleCount {
-    $count = 0
+# One-time cleanup of the retired browser block. AppLocker is now managed separately, so this only
+# clears the old KNIX-* rules, and only when they are the ONLY rules present. Safe to delete later.
+function Remove-LegacyBrowserBlock {
     $pol = Get-AppLockerPolicy -Local -ErrorAction SilentlyContinue
-    if ($pol) {
-        foreach ($c in $pol.RuleCollections) { foreach ($r in $c) { if ($r.Name -notlike 'KNIX-*') { $count++ } } }
-    }
-    return $count
-}
-
-function Build-BrowserBlockXml {
-    $keep = @('chrome.exe', 'msedge.exe')
-    $bins = @($script:Cfg.BlockedBrowserBinaries | Where-Object { $_ -and ($keep -notcontains $_.ToLower()) } | Sort-Object -Unique)
-    $sb = New-Object Text.StringBuilder
-    [void]$sb.AppendLine('<AppLockerPolicy Version="1">')
-    [void]$sb.AppendLine('  <RuleCollection Type="Exe" EnforcementMode="Enabled">')
-    $id = New-StableGuid 'KNIX-Allow-all'
-    [void]$sb.AppendLine("    <FilePathRule Id=`"$id`" Name=`"KNIX-Allow-all`" Description=`"Allow everything; browser deny rules below take precedence`" UserOrGroupSid=`"S-1-1-0`" Action=`"Allow`"><Conditions><FilePathCondition Path=`"*`" /></Conditions></FilePathRule>")
-    foreach ($b in $bins) {
-        $idPub  = New-StableGuid "KNIX-Deny-$b-signed"
-        $idPath = New-StableGuid "KNIX-Deny-$b-path"
-        # Signed binary matched on its embedded original file name, so renamed copies are still caught.
-        [void]$sb.AppendLine("    <FilePublisherRule Id=`"$idPub`" Name=`"KNIX-Deny-$b-signed`" Description=`"Blocked browser`" UserOrGroupSid=`"S-1-1-0`" Action=`"Deny`"><Conditions><FilePublisherCondition PublisherName=`"*`" ProductName=`"*`" BinaryName=`"$b`"><BinaryVersionRange LowSection=`"*`" HighSection=`"*`" /></FilePublisherCondition></Conditions></FilePublisherRule>")
-        # Path rule as a second layer (unsigned or oddly signed copies).
-        [void]$sb.AppendLine("    <FilePathRule Id=`"$idPath`" Name=`"KNIX-Deny-$b-path`" Description=`"Blocked browser`" UserOrGroupSid=`"S-1-1-0`" Action=`"Deny`"><Conditions><FilePathCondition Path=`"*\$b`" /></Conditions></FilePathRule>")
-    }
-    [void]$sb.AppendLine('  </RuleCollection>')
-    [void]$sb.AppendLine('</AppLockerPolicy>')
-    return $sb.ToString()
-}
-
-function Enable-AppIdService {
-    try { Set-Service -Name AppIDSvc -StartupType Automatic -ErrorAction Stop }
-    catch { & sc.exe config appidsvc start= auto | Out-Null }
-    $svc = Get-Service -Name AppIDSvc
-    if ($svc.Status -ne 'Running') { Start-Service -Name AppIDSvc -ErrorAction Stop; Write-Log 'Started Application Identity service' 'DRIFT' }
-}
-
-function Set-BrowserBlock {
-    if ((Get-ForeignAppLockerRuleCount) -gt 0) {
-        $script:Failures++
-        Write-Log 'Existing non-Knix AppLocker rules found. Browser block NOT applied (would overwrite them). Merge manually.' 'ERROR'
-        Add-Result 'Browser block' 'FAILED' 'existing non-Knix AppLocker rules, not overwritten'
-        return
-    }
-    $xml = Build-BrowserBlockXml
-    $hash = [BitConverter]::ToString([Security.Cryptography.SHA256]::Create().ComputeHash([Text.Encoding]::UTF8.GetBytes($xml)))
-    $expected = ([regex]::Matches($xml, 'Name="KNIX-')).Count
-    $pol = Get-AppLockerPolicy -Local -ErrorAction SilentlyContinue
-    $have = 0
-    if ($pol) { foreach ($c in $pol.RuleCollections) { foreach ($r in $c) { $have++ } } }
-    $stored = if (Test-Path $StatePath) { (Get-Content $StatePath -Raw).Trim() } else { '' }
-    $applied = $false
-    if ($stored -ne $hash -or $have -ne $expected) {
-        $tmp = Join-Path $env:TEMP 'knix-applocker.xml'
-        Set-Content -LiteralPath $tmp -Value $xml -Encoding UTF8
-        try { Set-AppLockerPolicy -XmlPolicy $tmp } finally { Remove-Item $tmp -Force -ErrorAction SilentlyContinue }
-        Set-Content -LiteralPath $StatePath -Value $hash
-        Write-Log "AppLocker browser block applied ($expected rules)" 'DRIFT'
-        $applied = $true
-    }
-    Enable-AppIdService
-    $n = [int](($expected - 1) / 2)
-    Add-Result 'Browser block (only Chrome + Edge)' $(if ($applied) { 'APPLIED' } else { 'OK' }) "$n browsers denied via AppLocker"
-}
-
-function Remove-BrowserBlock {
-    if ((Get-ForeignAppLockerRuleCount) -gt 0) { Write-Log 'Foreign AppLocker rules present, left untouched' 'WARN'; return }
+    if (-not $pol) { return }
+    $names = @()
+    foreach ($c in $pol.RuleCollections) { foreach ($r in $c) { $names += $r.Name } }
+    if ($names.Count -eq 0 -or @($names | Where-Object { $_ -notlike 'KNIX-*' }).Count -gt 0) { return }
     $tmp = Join-Path $env:TEMP 'knix-applocker-empty.xml'
     Set-Content -LiteralPath $tmp -Value '<AppLockerPolicy Version="1"><RuleCollection Type="Exe" EnforcementMode="NotConfigured" /></AppLockerPolicy>' -Encoding UTF8
     try { Set-AppLockerPolicy -XmlPolicy $tmp } finally { Remove-Item $tmp -Force -ErrorAction SilentlyContinue }
-    Remove-Item $StatePath -Force -ErrorAction SilentlyContinue
-    Write-Log 'AppLocker browser block removed'
+    Write-Log 'Removed legacy KNIX browser-block AppLocker rules' 'DRIFT'
 }
 
 # ----------------------------------------------------------------------------- install / tasks
@@ -469,7 +396,7 @@ switch ($Mode) {
         Invoke-Step 'Machine policy'   { Set-MachinePolicies }
         Invoke-Step 'Default profile'  { Set-DefaultUserHive }
         Invoke-Step 'Remove apps'      { Remove-UnwantedApps }
-        Invoke-Step 'Browser block'    { Set-BrowserBlock }
+        Invoke-Step 'Legacy cleanup'   { Remove-LegacyBrowserBlock }
         Invoke-Step 'Run user task'    { Start-ScheduledTask -TaskPath $TaskPath -TaskName 'Knix Policy - User' }
     }
     'Machine' {
@@ -477,7 +404,7 @@ switch ($Mode) {
         Invoke-Step 'Machine policy'   { Set-MachinePolicies }
         Invoke-Step 'Default profile'  { Set-DefaultUserHive }
         Invoke-Step 'Remove apps'      { Remove-UnwantedApps }
-        Invoke-Step 'Browser block'    { Set-BrowserBlock }
+        Invoke-Step 'Legacy cleanup'   { Remove-LegacyBrowserBlock }
     }
     'User' {
         $script:restartExplorer = $false
@@ -494,7 +421,6 @@ switch ($Mode) {
         if (-not (Test-IsAdmin)) { Write-Log 'Must run elevated/SYSTEM' 'ERROR'; exit 1 }
         Invoke-Step 'Remove tasks'   { foreach ($t in 'Knix Policy - Machine', 'Knix Policy - User') { Unregister-ScheduledTask -TaskName $t -TaskPath $TaskPath -Confirm:$false -ErrorAction SilentlyContinue } }
         Invoke-Step 'Revert policy'  { Undo-MachinePolicies }
-        Invoke-Step 'Revert AppLocker' { Remove-BrowserBlock }
         Write-Log 'Reverted. Per-user taskbar prefs and removed apps are not restored.'
     }
 }

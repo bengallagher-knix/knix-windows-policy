@@ -16,7 +16,7 @@ as environment variables so the script can post a per-policy summary to Slack. N
 Deploys AppLocker in audit-only mode (blocks nothing) and collects what would have been blocked.
 - `-Mode Install`: apply the audit policy. `-Mode Collect`: summarise new findings, write a CSV, post to Slack. `-Mode Remove`: undo.
 - Slack token/channel come from the Atera bootstrap's environment only. Nothing secret is stored here or on devices.
-- It refuses to run if other AppLocker rules exist (including the enforced browser block from `Apply-KnixPolicy.ps1`), and vice versa.
+- It refuses to run if AppLocker rules it did not create exist. `Apply-KnixPolicy.ps1` no longer touches AppLocker.
 
 ## Re-enable OneDrive
 Set `$OneDrive = 'Allow'` in the Atera bootstrap, or on a device:
