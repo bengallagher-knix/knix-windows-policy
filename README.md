@@ -12,12 +12,17 @@ as environment variables so the script can post a per-policy summary to Slack. N
 1. Run the Atera bootstrap on one pilot device first, as System. Check `C:\ProgramData\Knix\Policy\policy.log`.
 2. Then run on all devices and schedule it (weekly is enough).
 
-## AppLocker audit (`Apply-KnixAppLockerAudit.ps1`)
-Deploys AppLocker in audit-only mode (blocks nothing) and collects what would have been blocked.
-- `-Mode Install`: apply the audit policy. `-Mode Collect`: summarise new findings, write a CSV, post to Slack. `-Mode Remove`: undo.
+## WDAC audit (`Apply-KnixWdacAudit.ps1`)
+Deploys Windows Defender Application Control (App Control for Business) in **audit mode** (blocks nothing) and collects what
+would have been blocked. Built from Microsoft's `DefaultWindows_Audit` template: Windows, Store apps and WHCP drivers are
+allowed, everything else is reported. `-Base AllowMicrosoft` also allows anything Microsoft-signed.
+- `-Mode Install`: build and deploy the audit policy (no restart on Windows 11 22H2+; safe to re-run, `-Force` redeploys).
+  `-Mode Collect`: summarise new findings, write a CSV and a suggested allow policy, post to Slack. `-Mode Remove`: undo.
+- It uses a fixed policy ID and only ever touches its own policy. Other WDAC policies on the device are left alone.
 - Slack token/channel come from the Atera bootstrap's environment only. Nothing secret is stored here or on devices.
-- Install **replaces** any existing local AppLocker rules and saves the old policy first to
-  `C:\ProgramData\Knix\AppLockerAudit\previous-policy-<time>.xml`. `Apply-KnixPolicy.ps1` does not touch AppLocker.
+- Needs Windows 11 and the ConfigCI PowerShell cmdlets. Files and log: `C:\ProgramData\Knix\WdacAudit`.
+- `Apply-KnixPolicy.ps1` does not touch WDAC or AppLocker. Devices that got the old AppLocker audit keep that audit policy until
+  it is cleared (run the previous script version's `-Mode Remove`, commit 1ff6935).
 
 ## Taskbar
 Not managed. Users set up their own taskbar. Older versions set search/Widgets/Copilot policies; those are removed from devices
