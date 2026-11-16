@@ -16,8 +16,9 @@
   KNIX_SLACK_TOKEN / KNIX_SLACK_CHANNEL as environment variables for that one run. Without them the script
   still writes the local CSV and just skips Slack.
 
-  NOTE: this replaces the LOCAL AppLocker policy. It refuses to run if rules that are not its own exist
-  (rules named KNIXAUDIT-* are treated as its own and replaced).
+  NOTE: Install REPLACES the whole LOCAL AppLocker policy, including rules it did not create. The previous
+  policy is saved to C:\ProgramData\Knix\AppLockerAudit\previous-policy-<time>.xml first. A domain GPO, if
+  any, is not affected. Remove only clears a policy this script created and refuses if other rules are present.
 
 .PARAMETER IncludeDll
   Also audit DLL loads. Very noisy and slower. Leave off for the first round.
@@ -170,8 +171,12 @@ function Set-AuditLogs {
 }
 
 function Install-Audit {
-    if ((Get-ForeignRuleCount) -gt 0) {
-        throw 'Existing AppLocker rules that this script did not create were found. Not overwriting them.'
+    # Any existing local rules are REPLACED by the audit policy. The old policy is saved first so nothing is lost.
+    $replaced = Get-ForeignRuleCount
+    if ($replaced -gt 0) {
+        $bak = Join-Path $Root ('previous-policy-{0}.xml' -f (Get-Date -Format 'yyyyMMdd-HHmmss'))
+        Set-Content -LiteralPath $bak -Value (Get-AppLockerPolicy -Local -Xml) -Encoding UTF8
+        Write-Log "Replacing $replaced existing AppLocker rule(s) that this script did not create. Previous policy saved to $bak" 'WARN'
     }
     $xml = Build-AuditXml
     $tmp = Join-Path $env:TEMP 'knix-applocker-audit.xml'
@@ -187,7 +192,8 @@ function Install-Audit {
     Write-Log "Audit-only AppLocker policy active ($mode collections). Nothing is blocked."
     $dll = if ($IncludeDll) { 'EXE, DLL, scripts, MSI, packaged apps' } else { 'EXE, scripts, MSI, packaged apps' }
     $adm = if ($AdminsExempt) { 'admins exempt' } else { 'admins audited too' }
-    [void](Send-SlackMessage ":mag: *AppLocker AUDIT deployed on $($env:COMPUTERNAME)* - $dll ($adm). Nothing is blocked; findings come with the next Collect.")
+    $rep = if ($replaced -gt 0) { " Replaced $replaced existing rule(s); old policy backed up on the device." } else { '' }
+    [void](Send-SlackMessage ":mag: *AppLocker AUDIT deployed on $($env:COMPUTERNAME)* - $dll ($adm). Nothing is blocked; findings come with the next Collect.$rep")
 }
 
 function Remove-Audit {
