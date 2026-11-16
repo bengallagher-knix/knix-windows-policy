@@ -18,11 +18,9 @@ Deploys AppLocker in audit-only mode (blocks nothing) and collects what would ha
 - Slack token/channel come from the Atera bootstrap's environment only. Nothing secret is stored here or on devices.
 - It refuses to run if AppLocker rules it did not create exist. `Apply-KnixPolicy.ps1` no longer touches AppLocker.
 
-## Taskbar (defaults only, not locked)
-Start on the left, search hidden, Task View off, Copilot button off, Store and Copilot unpinned. These are set **once per user**
-(and in the Default User profile for new accounts). After that users can change the Taskbar settings freely.
-Widgets are not defaulted off: Windows blocks scripts from writing that setting, and the only way is a policy, which would lock the page.
-Older versions set search/Widgets/Copilot policies. Those values are removed from devices automatically.
+## Taskbar
+Not managed. Users set up their own taskbar. Older versions set search/Widgets/Copilot policies; those are removed from devices
+automatically. Taskbar values written to users' profiles by older versions are left as they are, and users can change them.
 
 ## Security baseline (always on)
 Password length 12+ and no forced expiry, lockout after 10 tries (15 min), Guest and built-in Administrator disabled

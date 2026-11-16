@@ -9,8 +9,8 @@
 
   Self-heals: Install mode copies this script to C:\ProgramData\Knix\Policy (admin-only write) and
   registers two scheduled tasks that re-apply the baseline, so drift is corrected even if RMM is offline.
-    \Knix\Knix Policy - Machine   SYSTEM, at startup + hourly   (HKLM policy, app removal, Default User hive)
-    \Knix\Knix Policy - User      Users group, at logon + hourly (taskbar defaults once per user, WhatsApp Win32)
+    \Knix\Knix Policy - Machine   SYSTEM, at startup + hourly   (HKLM policy, app removal)
+    \Knix\Knix Policy - User      Users group, at logon + hourly (WhatsApp Win32 removal, OneDrive process)
 
   REQUIREMENTS: users must be standard users (not local admins). Windows 11, Windows PowerShell 5.1.
 
@@ -42,7 +42,7 @@
   built-in Administrator disabled, firewall, Windows Update deadlines, SMBv1/LLMNR off, RDP NLA,
   AutoRun off, UAC, and audit/log settings. Remove mode does NOT undo account policy or disabled accounts.
   Microsoft Defender is deliberately not managed. BitLocker is only CHECKED and reported, never changed.
-  Config: C:\ProgramData\Knix\Policy\config.json (lock timeout, app list, taskbar unpin list, OneDrive switch, options above).
+  Config: C:\ProgramData\Knix\Policy\config.json (lock timeout, app list, OneDrive switch, options above).
   Logs:   C:\ProgramData\Knix\Policy\policy.log (machine)  |  %LOCALAPPDATA%\Knix\policy-user.log (user)
   Exit code 0 = all steps succeeded, 1 = one or more steps failed (see log).
 #>
@@ -131,8 +131,6 @@ function Get-DefaultConfig {
             'Microsoft.XboxIdentityProvider', 'Microsoft.XboxSpeechToTextOverlay', 'Microsoft.Xbox.TCUI',
             '5319275A.WhatsAppDesktop'
         )
-        # Taskbar items to unpin once per user, at their first logon (display names, wildcards allowed).
-        UnpinFromTaskbar       = @('Microsoft Store', 'Copilot')
         # Windows Update install deadlines (days after an update is offered before it is forced).
         QualityUpdateDeadlineDays = 7
         FeatureUpdateDeadlineDays = 14
@@ -180,8 +178,7 @@ function Get-MachinePolicies {
         @{ G = 'Base'; A = 'Fast Startup disabled'; P = 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Power'; N = 'HiberbootEnabled'; V = 0 }
         # 2. Lock after inactivity (Security Policy: "Interactive logon: Machine inactivity limit")
         @{ G = 'Base'; A = "Screen lock after $([int]$script:Cfg.LockTimeoutSeconds / 60) min"; P = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System'; N = 'InactivityTimeoutSecs'; V = [int]$script:Cfg.LockTimeoutSeconds }
-        # 3. Taskbar layout is a DEFAULT only (set once per user, see Set-UserSettings). It is deliberately not a
-        #    policy, so the Taskbar settings page stays fully editable for users.
+        # 3. The taskbar is deliberately NOT managed: users set it up however they like.
         # 5. Game Bar off (stops the "get an app for ms-gamingoverlay" popup once Xbox apps are removed)
         @{ G = 'Base'; A = 'Game Bar disabled'; P = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\GameDVR'; N = 'AllowGameDVR'; V = 0 }
         # 4. OneDrive off. Group 'OneDrive' is removed (not set) when AllowOneDrive = true.
@@ -292,48 +289,6 @@ function Undo-MachinePolicies {
     foreach ($e in (Get-MachinePolicies)) {
         if ($e.K -or ($script:RevertSkip -contains $e.P)) { continue }
         [void](Remove-RegValue $e.P $e.N)
-    }
-}
-
-# ----------------------------------------------------------------------------- per-user settings
-function Get-UserSettings {
-    $adv = 'Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced'
-    @(
-        @{ S = $adv; N = 'TaskbarAl'; V = 0 }                 # Start button on the left
-        @{ S = $adv; N = 'ShowTaskViewButton'; V = 0 }        # Task View button off
-        @{ S = $adv; N = 'ShowCopilotButton'; V = 0 }         # Copilot button off
-        @{ S = 'Software\Microsoft\Windows\CurrentVersion\Search'; N = 'SearchboxTaskbarMode'; V = 0 }  # Search hidden
-    )
-}
-
-function Set-UserSettings([string]$Hive) {
-    $changed = $false
-    foreach ($s in (Get-UserSettings)) {
-        try {
-            if (Set-RegValue "$Hive\$($s.S)" $s.N $s.V) { $changed = $true }
-        } catch { Write-Log "Could not set $($s.N): $($_.Exception.Message)" 'WARN' }
-    }
-    return $changed
-}
-
-# Seed the Default User profile so new accounts start compliant.
-function Set-DefaultUserHive {
-    $ntuser = Join-Path $env:SystemDrive 'Users\Default\NTUSER.DAT'
-    if (-not (Test-Path $ntuser)) { Write-Log 'Default User hive not found, skipped' 'WARN'; return }
-    & reg.exe load 'HKU\KnixDefault' $ntuser *> $null
-    if ($LASTEXITCODE -ne 0) { Write-Log 'Could not load Default User hive, skipped' 'WARN'; return }
-    try {
-        $chg = Set-UserSettings 'Registry::HKEY_USERS\KnixDefault'
-        # Per-user prefs on existing profiles are applied by the logon task, so SYSTEM can only report the template.
-        Add-Result 'Taskbar defaults (new profiles, users can change them)' $(if ($chg) { 'APPLIED' } else { 'OK' }) 'existing users get them once at next logon'
-    }
-    finally {
-        [gc]::Collect(); [gc]::WaitForPendingFinalizers()
-        for ($i = 0; $i -lt 5; $i++) {
-            & reg.exe unload 'HKU\KnixDefault' *> $null
-            if ($LASTEXITCODE -eq 0) { break }
-            Start-Sleep -Milliseconds 500
-        }
     }
 }
 
@@ -542,20 +497,6 @@ function Register-PolicyTasks {
 }
 
 # ----------------------------------------------------------------------------- user-mode actions
-function Remove-TaskbarPins {
-    $apps = (New-Object -ComObject Shell.Application).NameSpace('shell:::{4234d49b-0245-4df3-b780-3893943456e1}')
-    $unpinned = $false
-    foreach ($item in $apps.Items()) {
-        foreach ($pat in @($script:Cfg.UnpinFromTaskbar)) {
-            if ($item.Name -like $pat) {
-                $verb = $item.Verbs() | Where-Object { $_.Name.Replace('&', '') -match 'Unpin from taskbar' } | Select-Object -First 1
-                if ($verb) { $verb.DoIt(); $unpinned = $true; Write-Log "Unpinned '$($item.Name)' from taskbar" 'DRIFT' }
-            }
-        }
-    }
-    return $unpinned
-}
-
 function Remove-WhatsAppWin32 {
     # Non-Store (Squirrel) WhatsApp installs per user under %LOCALAPPDATA%\WhatsApp
     $upd = Join-Path $env:LOCALAPPDATA 'WhatsApp\Update.exe'
@@ -633,7 +574,6 @@ switch ($Mode) {
         Invoke-Step 'BitLocker'        { Test-BitLockerStatus }
         Invoke-Step 'Windows version'  { Get-WindowsVersionRow }
         Invoke-Step 'Patch status'     { Test-PatchStatus }
-        Invoke-Step 'Default profile'  { Set-DefaultUserHive }
         Invoke-Step 'Remove apps'      { Remove-UnwantedApps }
         Invoke-Step 'Run user task'    { Start-ScheduledTask -TaskPath $TaskPath -TaskName 'Knix Policy - User' }
     }
@@ -646,31 +586,19 @@ switch ($Mode) {
         Invoke-Step 'BitLocker'        { Test-BitLockerStatus }
         Invoke-Step 'Windows version'  { Get-WindowsVersionRow }
         Invoke-Step 'Patch status'     { Test-PatchStatus }
-        Invoke-Step 'Default profile'  { Set-DefaultUserHive }
         Invoke-Step 'Remove apps'      { Remove-UnwantedApps }
     }
     'User' {
-        $script:restartExplorer = $false
-        # Taskbar layout is applied ONCE per user as a default. After that the user can change it freely.
-        $mark = 'HKCU:\Software\Knix\Policy'
-        $done = (Get-ItemProperty -LiteralPath $mark -Name 'TaskbarDefaultsApplied' -ErrorAction SilentlyContinue).TaskbarDefaultsApplied -eq 1
-        if (-not $done) {
-            Invoke-Step 'User settings' { if (Set-UserSettings 'HKCU:') { $script:restartExplorer = $true } }
-            Invoke-Step 'Unpin apps'    { if (Remove-TaskbarPins) { $script:restartExplorer = $true } }
-            Invoke-Step 'Taskbar marker' { [void](Set-RegValue $mark 'TaskbarDefaultsApplied' 1) }
-        }
         Invoke-Step 'WhatsApp'      { Remove-WhatsAppWin32 }
         if (-not $script:Cfg.AllowOneDrive) {
             Get-Process -Name OneDrive -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
         }
-        # Taskbar prefs are read at shell start; restart Explorer once, only when something changed.
-        if ($script:restartExplorer) { Write-Log 'Restarting Explorer to apply taskbar changes'; Stop-Process -Name explorer -Force -ErrorAction SilentlyContinue }
     }
     'Remove' {
         if (-not (Test-IsAdmin)) { Write-Log 'Must run elevated/SYSTEM' 'ERROR'; exit 1 }
         Invoke-Step 'Remove tasks'   { foreach ($t in 'Knix Policy - Machine', 'Knix Policy - User') { Unregister-ScheduledTask -TaskName $t -TaskPath $TaskPath -Confirm:$false -ErrorAction SilentlyContinue } }
         Invoke-Step 'Revert policy'  { Undo-MachinePolicies }
-        Write-Log 'Reverted registry policies. NOT undone: password/lockout policy, Guest and built-in Administrator state, per-user taskbar prefs, removed apps.'
+        Write-Log 'Reverted registry policies. NOT undone: password/lockout policy, Guest and built-in Administrator state, removed apps.'
     }
 }
 
