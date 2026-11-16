@@ -10,7 +10,7 @@
   Self-heals: Install mode copies this script to C:\ProgramData\Knix\Policy (admin-only write) and
   registers two scheduled tasks that re-apply the baseline, so drift is corrected even if RMM is offline.
     \Knix\Knix Policy - Machine   SYSTEM, at startup + hourly   (HKLM policy, app removal, Default User hive)
-    \Knix\Knix Policy - User      Users group, at logon + hourly (taskbar prefs, unpin Store/Copilot, WhatsApp Win32)
+    \Knix\Knix Policy - User      Users group, at logon + hourly (taskbar defaults once per user, WhatsApp Win32)
 
   REQUIREMENTS: users must be standard users (not local admins). Windows 11, Windows PowerShell 5.1.
 
@@ -131,7 +131,7 @@ function Get-DefaultConfig {
             'Microsoft.XboxIdentityProvider', 'Microsoft.XboxSpeechToTextOverlay', 'Microsoft.Xbox.TCUI',
             '5319275A.WhatsAppDesktop'
         )
-        # Taskbar items to unpin at each user logon (display names, wildcards allowed).
+        # Taskbar items to unpin once per user, at their first logon (display names, wildcards allowed).
         UnpinFromTaskbar       = @('Microsoft Store', 'Copilot')
         # Windows Update install deadlines (days after an update is offered before it is forced).
         QualityUpdateDeadlineDays = 7
@@ -180,10 +180,8 @@ function Get-MachinePolicies {
         @{ G = 'Base'; A = 'Fast Startup disabled'; P = 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Power'; N = 'HiberbootEnabled'; V = 0 }
         # 2. Lock after inactivity (Security Policy: "Interactive logon: Machine inactivity limit")
         @{ G = 'Base'; A = "Screen lock after $([int]$script:Cfg.LockTimeoutSeconds / 60) min"; P = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System'; N = 'InactivityTimeoutSecs'; V = [int]$script:Cfg.LockTimeoutSeconds }
-        # 3. Taskbar search hidden, Widgets off, Copilot button off
-        @{ G = 'Base'; A = 'Taskbar search hidden'; P = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\Windows Search'; N = 'SearchOnTaskbarMode'; V = 0 }
-        @{ G = 'Base'; A = 'Widgets disabled'; P = 'HKLM:\SOFTWARE\Policies\Microsoft\Dsh'; N = 'AllowNewsAndInterests'; V = 0 }
-        @{ G = 'Base'; A = 'Copilot button disabled'; P = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsCopilot'; N = 'TurnOffWindowsCopilot'; V = 1 }
+        # 3. Taskbar layout is a DEFAULT only (set once per user, see Set-UserSettings). It is deliberately not a
+        #    policy, so the Taskbar settings page stays fully editable for users.
         # 5. Game Bar off (stops the "get an app for ms-gamingoverlay" popup once Xbox apps are removed)
         @{ G = 'Base'; A = 'Game Bar disabled'; P = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\GameDVR'; N = 'AllowGameDVR'; V = 0 }
         # 4. OneDrive off. Group 'OneDrive' is removed (not set) when AllowOneDrive = true.
@@ -270,6 +268,9 @@ function Set-MachinePolicies {
     foreach ($r in @(
         @{ P = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU'; N = 'NoAutoUpdate' }
         @{ P = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU'; N = 'AUOptions' }
+        @{ P = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\Windows Search'; N = 'SearchOnTaskbarMode' }
+        @{ P = 'HKLM:\SOFTWARE\Policies\Microsoft\Dsh'; N = 'AllowNewsAndInterests' }
+        @{ P = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsCopilot'; N = 'TurnOffWindowsCopilot' }
     )) {
         try { if (Remove-RegValue $r.P $r.N) { $changed++ } } catch { Write-Log "Could not remove retired $($r.N): $($_.Exception.Message)" 'WARN' }
     }
@@ -324,7 +325,7 @@ function Set-DefaultUserHive {
     try {
         $chg = Set-UserSettings 'Registry::HKEY_USERS\KnixDefault'
         # Per-user prefs on existing profiles are applied by the logon task, so SYSTEM can only report the template.
-        Add-Result 'Taskbar: Start left, no Task View/Search (new profiles)' $(if ($chg) { 'APPLIED' } else { 'OK' }) 'existing users enforced at logon'
+        Add-Result 'Taskbar defaults (new profiles, users can change them)' $(if ($chg) { 'APPLIED' } else { 'OK' }) 'existing users get them once at next logon'
     }
     finally {
         [gc]::Collect(); [gc]::WaitForPendingFinalizers()
@@ -650,8 +651,14 @@ switch ($Mode) {
     }
     'User' {
         $script:restartExplorer = $false
-        Invoke-Step 'User settings' { if (Set-UserSettings 'HKCU:') { $script:restartExplorer = $true } }
-        Invoke-Step 'Unpin apps'    { if (Remove-TaskbarPins) { $script:restartExplorer = $true } }
+        # Taskbar layout is applied ONCE per user as a default. After that the user can change it freely.
+        $mark = 'HKCU:\Software\Knix\Policy'
+        $done = (Get-ItemProperty -LiteralPath $mark -Name 'TaskbarDefaultsApplied' -ErrorAction SilentlyContinue).TaskbarDefaultsApplied -eq 1
+        if (-not $done) {
+            Invoke-Step 'User settings' { if (Set-UserSettings 'HKCU:') { $script:restartExplorer = $true } }
+            Invoke-Step 'Unpin apps'    { if (Remove-TaskbarPins) { $script:restartExplorer = $true } }
+            Invoke-Step 'Taskbar marker' { [void](Set-RegValue $mark 'TaskbarDefaultsApplied' 1) }
+        }
         Invoke-Step 'WhatsApp'      { Remove-WhatsAppWin32 }
         if (-not $script:Cfg.AllowOneDrive) {
             Get-Process -Name OneDrive -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
