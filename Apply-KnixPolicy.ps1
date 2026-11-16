@@ -202,13 +202,13 @@ function Get-MachinePolicies {
         @{ G = 'Base'; A = 'Firewall on, inbound blocked (all profiles)'; P = "$fw\PrivateProfile";  N = 'DefaultInboundAction'; V = 1 }
         @{ G = 'Base'; A = 'Firewall on, inbound blocked (all profiles)'; P = "$fw\PublicProfile";   N = 'EnableFirewall'; V = 1 }
         @{ G = 'Base'; A = 'Firewall on, inbound blocked (all profiles)'; P = "$fw\PublicProfile";   N = 'DefaultInboundAction'; V = 1 }
-        # Windows Update: install automatically, forced deadlines, users cannot pause
-        @{ G = 'Base'; A = 'Windows Update: auto-install, deadlines, no pause'; P = "$wu\AU"; N = 'NoAutoUpdate'; V = 0 }
-        @{ G = 'Base'; A = 'Windows Update: auto-install, deadlines, no pause'; P = "$wu\AU"; N = 'AUOptions'; V = 4 }
-        @{ G = 'Base'; A = 'Windows Update: auto-install, deadlines, no pause'; P = $wu; N = 'ConfigureDeadlineForQualityUpdates'; V = [int]$script:Cfg.QualityUpdateDeadlineDays }
-        @{ G = 'Base'; A = 'Windows Update: auto-install, deadlines, no pause'; P = $wu; N = 'ConfigureDeadlineForFeatureUpdates'; V = [int]$script:Cfg.FeatureUpdateDeadlineDays }
-        @{ G = 'Base'; A = 'Windows Update: auto-install, deadlines, no pause'; P = $wu; N = 'ConfigureDeadlineGracePeriod'; V = [int]$script:Cfg.UpdateGracePeriodDays }
-        @{ G = 'Base'; A = 'Windows Update: auto-install, deadlines, no pause'; P = $wu; N = 'SetDisablePauseUXAccess'; V = 1 }
+        # Windows Update: forced install deadlines only. Users can still open Windows Update, check, install early and
+        # restart when they like. The legacy "Configure Automatic Updates" values (NoAutoUpdate/AUOptions) are NOT set
+        # because they put the Settings page into a more restricted "managed" mode; deadlines work without them.
+        @{ G = 'Base'; A = 'Windows Update: install deadlines (manual use allowed)'; P = $wu; N = 'ConfigureDeadlineForQualityUpdates'; V = [int]$script:Cfg.QualityUpdateDeadlineDays }
+        @{ G = 'Base'; A = 'Windows Update: install deadlines (manual use allowed)'; P = $wu; N = 'ConfigureDeadlineForFeatureUpdates'; V = [int]$script:Cfg.FeatureUpdateDeadlineDays }
+        @{ G = 'Base'; A = 'Windows Update: install deadlines (manual use allowed)'; P = $wu; N = 'ConfigureDeadlineGracePeriod'; V = [int]$script:Cfg.UpdateGracePeriodDays }
+        @{ G = 'Base'; A = 'Windows Update: install deadlines (manual use allowed)'; P = $wu; N = 'SetDisablePauseUXAccess'; V = 1 }
         # Feature update pin (-TargetVersion). Y = registry value type. Group 'Pin' is removed when no version is set.
         @{ G = 'Pin'; A = 'Feature update pinned'; P = $wu; N = 'TargetReleaseVersion'; V = 1 }
         @{ G = 'Pin'; A = 'Feature update pinned'; P = $wu; N = 'ProductVersion'; V = 'Windows 11'; Y = 'String' }
@@ -265,6 +265,13 @@ function Set-MachinePolicies {
             continue
         }
         if ($didChange) { $changed++; $perArea[$e.A]++ }
+    }
+    # Values an earlier version set that are no longer wanted. Removed from devices that already have them.
+    foreach ($r in @(
+        @{ P = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU'; N = 'NoAutoUpdate' }
+        @{ P = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU'; N = 'AUOptions' }
+    )) {
+        try { if (Remove-RegValue $r.P $r.N) { $changed++ } } catch { Write-Log "Could not remove retired $($r.N): $($_.Exception.Message)" 'WARN' }
     }
     foreach ($a in $perArea.Keys) {
         if ($perArea[$a] -lt 0) { continue }   # failure already recorded

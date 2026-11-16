@@ -20,7 +20,7 @@ Deploys AppLocker in audit-only mode (blocks nothing) and collects what would ha
 
 ## Security baseline (always on)
 Password length 12+ and no forced expiry, lockout after 10 tries (15 min), Guest and built-in Administrator disabled
-(Administrator only if another enabled admin exists), firewall on / inbound blocked, Windows Update auto-install with deadlines and no pause, SMBv1 / LLMNR off, RDP requires NLA, AutoRun off,
+(Administrator only if another enabled admin exists), firewall on / inbound blocked, Windows Update install deadlines (users can still open Windows Update, check and install early, but not pause), SMBv1 / LLMNR off, RDP requires NLA, AutoRun off,
 UAC secure-desktop consent, 200 MB Security log, command lines in process-creation events.
 - Password and lockout rules affect **local** accounts only. AD/Entra accounts follow the directory's policy.
 - The Slack report also shows the Windows version/build and a **patch status** row (days since the newest quality update,
