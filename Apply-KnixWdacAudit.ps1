@@ -15,9 +15,13 @@
            generated from the audit events) to C:\ProgramData\Knix\WdacAudit and post a summary (and files) to Slack.
   Remove   Remove the audit policy. Only touches the policy this script created (fixed policy ID).
 
-  SECRETS: none are stored here or on the device. For Collect/Install the Atera bootstrap supplies
-  KNIX_SLACK_TOKEN / KNIX_SLACK_CHANNEL as environment variables for that one run. Without them the script
-  still writes the local CSV and just skips Slack.
+  SHEET: when KNIX_SHEET_WEBHOOK and KNIX_SHEET_KEY are set, Collect posts every finding to the Google Sheet
+  (tab "WDAC Audit Events") with the device name, serial number, Windows version, who is logged in and the user
+  the event ran as. In that case no per-device Slack message is sent. Without them it falls back to Slack.
+
+  SECRETS: none are stored here or on the device. The Atera bootstrap supplies KNIX_SLACK_TOKEN / KNIX_SLACK_CHANNEL
+  and KNIX_SHEET_WEBHOOK / KNIX_SHEET_KEY as environment variables for that one run. Without any of them the
+  script still writes the local CSV.
 
   NOTE: other WDAC policies already on the device are left alone. Two base policies are both applied, so if one
   of yours is ENFORCED it keeps blocking; this audit policy only adds logging.
@@ -120,6 +124,72 @@ function Send-SlackFiles([string[]]$Paths, [string]$Comment) {
     return $false
 }
 
+# ----------------------------------------------------------------------------- Google Sheet (webhook + key come from environment only)
+function Get-DeviceInfo {
+    $cs   = Get-CimInstance Win32_ComputerSystem
+    $bios = Get-CimInstance Win32_BIOS
+    $os   = Get-CimInstance Win32_OperatingSystem
+    $cv   = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion'
+    $serial = "$($bios.SerialNumber)".Trim()
+    $good = $serial -and ($serial -notmatch '^(0+|none|n/a|na|default string|to be filled by o\.?e\.?m\.?|system serial number|serial ?number|unknown|123456789.*)$')
+    $disp = if ($cv.DisplayVersion) { $cv.DisplayVersion } else { $cv.ReleaseId }
+    $win  = if ([int]$cv.CurrentBuild -ge 22000) { 'Windows 11' } else { 'Windows 10' }
+
+    # Who is logged in: console user plus the owner of every explorer.exe (covers RDP sessions too).
+    $owners = @()
+    foreach ($p in @(Get-CimInstance Win32_Process -Filter "Name='explorer.exe'" -ErrorAction SilentlyContinue)) {
+        $o = Invoke-CimMethod -InputObject $p -MethodName GetOwner -ErrorAction SilentlyContinue
+        if ($o -and $o.User) { $owners += ($o.Domain + '\' + $o.User) }
+    }
+    if ($cs.UserName) { $owners += $cs.UserName }
+
+    return @{
+        name      = $env:COMPUTERNAME
+        serial    = $(if ($good) { $serial } else { '' })
+        deviceKey = $(if ($good) { "SERIAL:$serial" } else { "HOST:$($env:COMPUTERNAME)" })
+        windows   = "$win $disp"
+        build     = "$($cv.CurrentBuild).$($cv.UBR)"
+        edition   = "$($os.Caption)"
+        loggedIn  = (($owners | Sort-Object -Unique) -join '; ')
+        model     = ("$($cs.Manufacturer) $($cs.Model)").Trim()
+        domain    = "$($cs.Domain)"
+        lastBoot  = $os.LastBootUpTime.ToUniversalTime().ToString('yyyy-MM-dd HH:mm:ss')
+    }
+}
+
+# Returns $null when the sheet webhook is not configured, otherwise $true/$false for "all rows were accepted".
+function Send-SheetEvents($Rows, $Info) {
+    $url = "$($env:KNIX_SHEET_WEBHOOK)".Trim()
+    $key = "$($env:KNIX_SHEET_KEY)".Trim()
+    if (-not $url -or -not $key) { return $null }
+    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+    $events = @($Rows | ForEach-Object {
+        @{
+            path = $_.Path; process = $_.Process; user = $_.Users; category = $_.Category; location = $_.Location
+            publisher = $_.Publisher; signed = [bool]$_.Signed; signingLevel = $_.SigningLevel; userWriteable = $_.UserWriteable
+            sha256 = $_.SHA256; count = [int]$_.Count; policy = $_.PolicyName
+            firstSeen = $_.FirstSeen.ToUniversalTime().ToString('yyyy-MM-dd HH:mm:ss')
+            lastSeen  = $_.LastSeen.ToUniversalTime().ToString('yyyy-MM-dd HH:mm:ss')
+        }
+    })
+    $chunk = 300
+    for ($i = 0; $i -lt $events.Count; $i += $chunk) {
+        $end = [Math]::Min($i + $chunk, $events.Count) - 1
+        $part = @($events[$i..$end])
+        $body = [Text.Encoding]::UTF8.GetBytes((@{ key = $key; device = $Info; events = $part } | ConvertTo-Json -Depth 5 -Compress))
+        $ok = $false
+        for ($try = 1; $try -le 3 -and -not $ok; $try++) {
+            try {
+                $r = Invoke-RestMethod -Uri $url -Method Post -ContentType 'application/json; charset=utf-8' -Body $body -UseBasicParsing -TimeoutSec 120
+                if ($r.ok) { $ok = $true } else { Write-Log "Sheet refused the events: $($r.error)" 'WARN'; break }
+            } catch { Write-Log "Sheet post failed (attempt $try): $($_.Exception.Message)" 'WARN'; Start-Sleep -Seconds (5 * $try) }
+        }
+        if (-not $ok) { return $false }
+    }
+    Write-Log "Posted $($events.Count) event row(s) to the sheet"
+    return $true
+}
+
 # ----------------------------------------------------------------------------- policy deploy
 # Runs a native tool without a stderr line turning into a terminating error (Windows PowerShell 5.1 behaviour).
 function Invoke-Native([string]$Exe, [string[]]$CmdArgs) {
@@ -189,7 +259,9 @@ function Install-Audit {
         $restart = ' A restart is needed before it takes effect (this Windows build has no CiTool).'
     }
     Write-Log "WDAC audit policy deployed (base: $Base). Nothing is blocked.$restart"
-    [void](Send-SlackMessage ":mag: *WDAC AUDIT deployed on $($env:COMPUTERNAME)* (base: $Base). Nothing is blocked; findings come with the next Collect.$restart")
+    if (-not "$($env:KNIX_SHEET_WEBHOOK)".Trim()) {
+        [void](Send-SlackMessage ":mag: *WDAC AUDIT deployed on $($env:COMPUTERNAME)* (base: $Base). Nothing is blocked; findings come with the next Collect.$restart")
+    }
 }
 
 function Remove-Audit {
@@ -308,7 +380,7 @@ function Get-AuditRows([datetime]$Since) {
                 Host = $env:COMPUTERNAME; Category = $cat; Location = (Get-PathLocation $path); Path = $path
                 Process = (ConvertTo-DosPath (Get-Field $x @('ProcessName')))
                 Publisher = ''; SigningLevel = $lvl; Signed = ([int]($lvl -replace '\D', '0') -gt 1)
-                UserWriteable = (Get-Field $x @('UserWriteable')); SHA256 = (Get-Field $x @('SHA256Hash'))
+                UserWriteable = (Get-Field $x @('UserWriteable')); SHA256 = (Get-Field $x @('SHA256Hash')); PolicyName = (Get-Field $x @('PolicyName'))
                 Count = 0; Users = (New-Object System.Collections.Generic.HashSet[string])
                 FirstSeen = $ev.TimeCreated; LastSeen = $ev.TimeCreated
             }
@@ -377,17 +449,20 @@ function Collect-Audit {
     $text = $lines -join "`n"
     if ($text.Length -gt 3500) { $text = $text.Substring(0, 3500) + "`n..." }
 
+    $sheet = Send-SheetEvents $rows (Get-DeviceInfo)     # $null = sheet webhook not configured
     $sent = $false
-    if (Get-SlackAuth) {
+    if ($null -ne $sheet) {
+        $sent = [bool]$sheet                             # findings are in the sheet, so no Slack message
+    } elseif (Get-SlackAuth) {
         $sent = Send-SlackFiles $files $text
         if (-not $sent) { $sent = Send-SlackMessage ($text + "`n_(files not uploaded; add files:write to the bot. CSV is on the device: $csv)_") }
     } else {
         Write-Log "No Slack token: report left on device at $csv"
         $sent = $true     # local-only run; still advance so the next run is incremental
     }
-    # Only move the watermark forward once the findings reached Slack (or this was a local-only run).
+    # Only move the watermark forward once the findings reached the sheet/Slack (or this was a local-only run).
     if ($sent) { @{ LastCollect = $started.ToString('o') } | ConvertTo-Json | Set-Content -LiteralPath $StatePath -Encoding UTF8 }
-    else { $script:Failures++; Write-Log 'Findings NOT delivered to Slack; next Collect will re-send them.' 'ERROR' }
+    else { $script:Failures++; Write-Log 'Findings NOT delivered; next Collect will re-send them.' 'ERROR' }
 
     # Keep the device tidy
     Get-ChildItem $Root -Include 'audit-*.csv', 'suggested-policy-*.xml' -Recurse -ErrorAction SilentlyContinue |

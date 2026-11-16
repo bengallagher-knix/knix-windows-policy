@@ -19,7 +19,10 @@ allowed, everything else is reported. `-Base AllowMicrosoft` also allows anythin
 - `-Mode Install`: build and deploy the audit policy (no restart on Windows 11 22H2+; safe to re-run, `-Force` redeploys).
   `-Mode Collect`: summarise new findings, write a CSV and a suggested allow policy, post to Slack. `-Mode Remove`: undo.
 - It uses a fixed policy ID and only ever touches its own policy. Other WDAC policies on the device are left alone.
-- Slack token/channel come from the Atera bootstrap's environment only. Nothing secret is stored here or on devices.
+- Findings go to the Google Sheet (tab "WDAC Audit Events", one row per device + file, with serial, Windows version, logged-in
+  users and the event's user) when `KNIX_SHEET_WEBHOOK` / `KNIX_SHEET_KEY` are set. Otherwise it falls back to a Slack summary.
+- Slack token/channel and the sheet webhook/key come from the Atera bootstrap's environment only. Nothing secret is stored
+  here or on devices.
 - Needs Windows 11 and the ConfigCI PowerShell cmdlets. Files and log: `C:\ProgramData\Knix\WdacAudit`.
 - `Apply-KnixPolicy.ps1` does not touch WDAC or AppLocker. Devices that got the old AppLocker audit keep that audit policy until
   it is cleared (run the previous script version's `-Mode Remove`, commit 1ff6935).
