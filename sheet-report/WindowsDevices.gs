@@ -244,11 +244,20 @@ function kwd_fetch_(url, options) {
   return resp;
 }
 
-function kwd_ateraOpts_() { return { headers: { 'X-API-KEY': kwd_prop_('WD_ATERA_API_KEY'), 'Accept': 'application/json' } }; }
+// Atera's newer API tokens are long JWTs and are sent as "Authorization: Bearer <token>". The older short API keys use
+// the X-API-KEY header. Pick by shape so either kind works.
+function kwd_ateraOpts_() {
+  var key = kwd_prop_('WD_ATERA_API_KEY');
+  var headers = { 'Accept': 'application/json' };
+  if (key.length > 100 || key.split('.').length === 3) headers['Authorization'] = 'Bearer ' + key;
+  else headers['X-API-KEY'] = key;
+  return { headers: headers };
+}
 
 function kwd_atera_(path) {
   var resp = kwd_fetch_(KWD.ATERA_BASE + path, kwd_ateraOpts_());
   var code = resp.getResponseCode();
+  if (code === 401) throw new Error('Atera returned 401 for ' + path + '. The token was rejected: check WD_ATERA_API_KEY.');
   if (code !== 200) throw new Error('Atera ' + path + ' returned HTTP ' + code + ': ' + resp.getContentText().substring(0, 200));
   return JSON.parse(resp.getContentText());
 }
