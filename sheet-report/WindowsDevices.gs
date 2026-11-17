@@ -200,6 +200,7 @@ function kwd_ss_() {
 // ============================================================================ Atera
 function kwd_prop_(name) {
   var v = PropertiesService.getScriptProperties().getProperty(name);
+  v = v ? String(v).trim() : '';      // a stray space or newline from copy/paste would make Atera answer 401
   if (!v) throw new Error('Missing script property ' + name + ' (Project Settings > Script properties).');
   return v;
 }
