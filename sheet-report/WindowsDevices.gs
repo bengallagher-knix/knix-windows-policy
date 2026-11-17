@@ -69,6 +69,7 @@ var KWD = {
   SOFTWARE_BATCH: 10,
   // Tried in order against the first device. The first one that answers with a list is remembered.
   SOFTWARE_ENDPOINTS: [
+    '/api/v3/agents/{guid}/installed-software',   // confirmed by wd_probe: returns { installedSoftware: [...] }
     '/api/v3/agents/{id}/software',
     '/api/v3/agents/{guid}/software',
     '/api/v3/agents/{id}/installed-software',
@@ -91,12 +92,13 @@ var KWD_BUILDS = {
 
 var KWD_HEADERS = [
   'Device Key', 'Serial Number', 'Device Name', 'Status', 'Status Reason', 'Windows', 'OS (Atera)', 'Build',
-  'Patch Level', 'Days Behind', 'Servicing Ends', 'Online', 'Last Seen (Atera)', 'Last Reboot', 'Customer',
-  'Domain', 'Manufacturer / Model', 'IP Address', 'Security Info', 'Atera Agent ID', 'Device GUID',
-  'First Seen', 'Last Sync', 'Present in Current Sync'
+  'Patch Level', 'Days Behind', 'Servicing Ends', 'Last Security Patch Installed', 'Pending Updates',
+  'Pending Security/Critical', 'Online', 'Last Seen (Atera)', 'Last Reboot', 'Logged-in Users', 'Last Login User',
+  'Customer', 'Domain', 'Manufacturer / Model', 'BIOS Version', 'BIOS Date', 'IP Address', 'Security Info',
+  'Atera Agent ID', 'Device GUID', 'First Seen', 'Last Sync', 'Present in Current Sync'
 ];
-var KWD_TEXT_COLS = ['Device Key', 'Serial Number', 'Build', 'Patch Level', 'Servicing Ends', 'Last Seen (Atera)',
-  'Last Reboot', 'IP Address', 'Atera Agent ID', 'Device GUID', 'First Seen', 'Last Sync'];
+var KWD_TEXT_COLS = ['Device Key', 'Serial Number', 'Build', 'Patch Level', 'Servicing Ends', 'Last Security Patch Installed',
+  'Last Seen (Atera)', 'Last Reboot', 'BIOS Version', 'BIOS Date', 'IP Address', 'Atera Agent ID', 'Device GUID', 'First Seen', 'Last Sync'];
 var KWD_SW_HEADERS = ['Device Key', 'Device Name', 'Application', 'Version', 'Publisher', 'Install Date', 'Synced'];
 var KWD_HIST_HEADERS = ['Build', 'Revision (UBR)', 'First Seen (UTC)', 'Baseline', 'Devices Now'];
 var KWD_EV_HEADERS = [
@@ -194,6 +196,7 @@ function kwd_run_(dryRun) {
     var devices = Object.keys(byKey).map(function (k) { return byKey[k]; });
     if (!devices.length) throw new Error('Atera returned no Windows devices (' + agents.length + ' agents in total). Sheet left untouched.');
 
+    kwd_enrichPatches_(devices);
     if (!dryRun) kwd_ensureSheets_(ss);
     var hist = kwd_loadHistory_(dryRun ? null : ss);
     devices.forEach(function (d) { if (d.build && d.ubr !== null) hist.observe(d.build, d.ubr, now); });
@@ -352,6 +355,12 @@ function kwd_normalize_(a) {
     onlineFlag: onlineRaw === true || String(onlineRaw).toLowerCase() === 'true',
     customer: String(kwd_pick_(lc, ['CustomerName'])),
     domain: String(kwd_pick_(lc, ['Domain', 'DomainName'])),
+    loggedIn: String(kwd_pick_(lc, ['CurrentLoggedUsers'])),
+    lastLogin: String(kwd_pick_(lc, ['LastLoginUser'])),
+    biosVersion: String(kwd_pick_(lc, ['BiosVersion'])),
+    biosDate: kwd_date_(kwd_pick_(lc, ['BiosReleaseDate'])),
+    marketingVersion: /^\d\dH\d$/i.test(String(kwd_pick_(lc, ['OSVersion'])).trim()) ? String(kwd_pick_(lc, ['OSVersion'])).trim().toUpperCase() : '',
+    lastSecPatch: null, pending: '', pendingSec: '',
     model: model,
     ip: String(ips),
     security: sec.join('; '),
@@ -407,12 +416,58 @@ function kwd_saveHistory_(ss, hist, devices) {
   if (rows.length) sh.getRange(2, 1, rows.length, KWD_HIST_HEADERS.length).setValues(rows);
 }
 
+// ============================================================================ Windows Update data from Atera
+// Pure: turns Atera's installed-patches / available-patches responses into the few facts we show.
+function kwd_parsePatches_(inst, avail) {
+  var res = { lastSecurityPatch: null, pending: '', pendingSecurity: '' };
+  var skip = /definition|malicious software removal/i;
+  var iu = (inst && (inst.installedUpdates || inst.InstalledUpdates)) || [];
+  iu.forEach(function (u) {
+    var text = String(u.name || '') + ' ' + String(u['class'] || '');
+    if (skip.test(text) || !/cumulative|security|quality/i.test(text)) return;
+    var d = kwd_date_(u.installDate);
+    if (d && (!res.lastSecurityPatch || d > res.lastSecurityPatch)) res.lastSecurityPatch = d;
+  });
+  var au = avail && (avail.availableUpdates || avail.AvailableUpdates);
+  if (au) {
+    var pend = au.filter(function (u) { return !skip.test(String(u.name || '') + ' ' + String(u['class'] || '')); });
+    res.pending = pend.length;
+    res.pendingSecurity = pend.filter(function (u) { return /security|critical|cumulative/i.test(String(u['class'] || '') + ' ' + String(u.name || '')); }).length;
+  }
+  return res;
+}
+
+// Two calls per device, in parallel batches. Any failure just leaves that device's patch columns blank.
+function kwd_enrichPatches_(devices) {
+  var started = Date.now();
+  var targets = devices.filter(function (d) { return d.guid; });
+  var opts = kwd_ateraOpts_();
+  for (var i = 0; i < targets.length && (Date.now() - started) < 180000; i += 10) {
+    var batch = targets.slice(i, i + 10);
+    var reqs = [];
+    batch.forEach(function (d) {
+      ['installed-patches', 'available-patches'].forEach(function (what) {
+        reqs.push({ url: KWD.ATERA_BASE + '/api/v3/agents/' + d.guid + '/' + what + '?page=1&itemsInPage=100', method: 'get', headers: opts.headers, muteHttpExceptions: true });
+      });
+    });
+    var resps;
+    try { resps = UrlFetchApp.fetchAll(reqs); } catch (e) { Logger.log('Patch fetch failed: ' + e.message); continue; }
+    batch.forEach(function (d, k) {
+      var a = resps[k * 2], b = resps[k * 2 + 1];
+      try {
+        var p = kwd_parsePatches_(a.getResponseCode() === 200 ? JSON.parse(a.getContentText()) : null, b.getResponseCode() === 200 ? JSON.parse(b.getContentText()) : null);
+        d.lastSecPatch = p.lastSecurityPatch; d.pending = p.pending; d.pendingSec = p.pendingSecurity;
+      } catch (e) { /* leave blank */ }
+    });
+  }
+}
+
 // ============================================================================ status
 function kwd_evaluate_(d, now, hist) {
   var reasons = [];
   var level = 0;
   var info = d.build ? KWD_BUILDS[d.build] : null;
-  d.windowsName = info ? info[0] : (d.build ? 'Windows build ' + d.build : d.os);
+  d.windowsName = info ? info[0] : (d.marketingVersion ? (d.build >= 22000 ? 'Windows 11 ' : 'Windows 10 ') + d.marketingVersion : (d.build ? 'Windows build ' + d.build : d.os));
   var seenAgo = d.lastSeen ? (now - d.lastSeen) / KWD_DAY : null;
   var online = d.onlineFlag || (seenAgo !== null && seenAgo <= KWD.ONLINE_WITHIN_DAYS);
 
@@ -458,6 +513,7 @@ function kwd_evaluate_(d, now, hist) {
     reasons.push('Atera did not report a patch level (build.revision)');
   }
 
+  if (level >= 1 && d.pendingSec > 0) reasons.push(d.pendingSec + ' security/critical update(s) pending in Windows Update');
   d.level = level;
   d.status = level === 3 ? 'RED' : level === 2 ? 'ORANGE' : level === 1 ? 'YELLOW' : (patchKnown ? 'CURRENT' : 'UNKNOWN');
   d.reason = reasons.join('; ');
@@ -540,12 +596,15 @@ function kwd_toRow_(ss, d, first, nowStr, present) {
     'Windows': d.windowsName, 'OS (Atera)': d.os, 'Build': d.build === null ? '' : String(d.build),
     'Patch Level': d.ubr === null ? '' : String(d.build) + '.' + d.ubr,
     'Days Behind': d.daysBehind === null ? '' : d.daysBehind, 'Servicing Ends': d.servicingEnds,
+    'Last Security Patch Installed': kwd_fmt_(ss, d.lastSecPatch), 'Pending Updates': d.pending, 'Pending Security/Critical': d.pendingSec,
     'Online': d.onlineFlag, 'Last Seen (Atera)': kwd_fmt_(ss, d.lastSeen), 'Last Reboot': kwd_fmt_(ss, d.lastReboot),
-    'Customer': d.customer, 'Domain': d.domain, 'Manufacturer / Model': d.model, 'IP Address': d.ip,
+    'Logged-in Users': d.loggedIn, 'Last Login User': d.lastLogin,
+    'Customer': d.customer, 'Domain': d.domain, 'Manufacturer / Model': d.model,
+    'BIOS Version': d.biosVersion, 'BIOS Date': kwd_fmt_(ss, d.biosDate), 'IP Address': d.ip,
     'Security Info': d.security, 'Atera Agent ID': d.agentId, 'Device GUID': d.guid,
     'First Seen': first, 'Last Sync': nowStr, 'Present in Current Sync': present
   };
-  return KWD_HEADERS.map(function (h) { return map[h]; });
+  return KWD_HEADERS.map(function (h) { var v = map[h]; return typeof v === 'string' ? kwd_safe_(v) : v; });
 }
 
 // ============================================================================ Slack (one message)
@@ -751,7 +810,13 @@ function wd_syncSoftware() {
       props.setProperty('WD_SW_ENDPOINT', template);
     }
 
-    var sw = ss.getSheetByName(KWD.TAB_SOFTWARE) || ss.insertSheet(KWD.TAB_SOFTWARE);
+    var sw = ss.getSheetByName(KWD.TAB_SOFTWARE);
+    if (!sw) {
+      sw = ss.insertSheet(KWD.TAB_SOFTWARE);
+      // Versions and dates must stay text, or Sheets turns "26.002.22031" and "2026-10-14" into numbers/dates.
+      [1, 4, 6, 7].forEach(function (c) { sw.getRange(2, c, Math.max(sw.getMaxRows() - 1, 1), 1).setNumberFormat('@'); });
+      sw.getRange(1, 1, sw.getMaxRows(), KWD_SW_HEADERS.length).createFilter();
+    }
     kwd_headerRow_(sw, KWD_SW_HEADERS);
     var cursor = Number(props.getProperty('WD_SW_CURSOR') || 0);
     if (cursor >= targets.length) cursor = 0;
@@ -793,14 +858,14 @@ function wd_syncSoftware() {
 }
 
 function kwd_softwareList_(j) {
-  var items = Array.isArray(j) ? j : (j.items || j.Items || []);
+  var items = Array.isArray(j) ? j : (j.installedSoftware || j.InstalledSoftware || j.items || j.Items || []);
   return items.map(function (x) {
     var lc = kwd_lc_(x);
     return {
-      name: String(kwd_pick_(lc, ['Name', 'SoftwareName', 'DisplayName', 'ApplicationName'])),
-      version: String(kwd_pick_(lc, ['Version', 'DisplayVersion', 'SoftwareVersion'])),
-      publisher: String(kwd_pick_(lc, ['Publisher', 'Vendor', 'SoftwarePublisher'])),
-      date: String(kwd_pick_(lc, ['InstallDate', 'InstalledOn', 'InstalledDate', 'SoftwareInstallDate']))
+      name: kwd_safe_(kwd_pick_(lc, ['Name', 'SoftwareName', 'DisplayName', 'ApplicationName'])),
+      version: kwd_safe_(kwd_pick_(lc, ['Version', 'DisplayVersion', 'SoftwareVersion'])),
+      publisher: kwd_safe_(kwd_pick_(lc, ['Publisher', 'Vendor', 'SoftwarePublisher'])),
+      date: kwd_safe_(String(kwd_pick_(lc, ['InstallDate', 'InstalledOn', 'InstalledDate', 'SoftwareInstallDate'])).substring(0, 10))
     };
   }).filter(function (r) { return r.name; });
 }
@@ -814,7 +879,7 @@ function kwd_discoverSoftwareEndpoint_(t) {
     if (resp.getResponseCode() !== 200) continue;
     try {
       var j = JSON.parse(resp.getContentText());
-      if (Array.isArray(j) || Array.isArray(j.items) || Array.isArray(j.Items)) return template;
+      if (Array.isArray(j) || Array.isArray(j.installedSoftware) || Array.isArray(j.items) || Array.isArray(j.Items)) return template;
     } catch (e) { /* not JSON, try the next one */ }
   }
   return '';
