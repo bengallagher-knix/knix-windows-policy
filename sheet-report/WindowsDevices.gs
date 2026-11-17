@@ -130,6 +130,32 @@ function wd_probe() {
   Logger.log('Done. For sharing, the KEYS and ENDPOINT lines are enough (no device data needed).');
 }
 
+// Use this when wd_probe gets HTTP 401. It tries the key a few ways and logs only status codes and the SHAPE of the key
+// (length, spaces, quotes), never the key itself.
+function wd_probeAuth() {
+  var key = kwd_prop_('WD_ATERA_API_KEY');
+  Logger.log('KEY SHAPE: length ' + key.length + ', has space ' + /\s/.test(key) + ', has quote ' + /["']/.test(key) +
+    ', starts with "Bearer" ' + /^bearer/i.test(key) + ', only hex/letters/digits/-/_ ' + /^[A-Za-z0-9_\-]+$/.test(key));
+  var tests = [
+    ['agents, X-API-KEY', '/api/v3/agents?page=1&itemsInPage=1', { 'X-API-KEY': key }],
+    ['agents no params, X-API-KEY', '/api/v3/agents', { 'X-API-KEY': key }],
+    ['alerts, X-API-KEY', '/api/v3/alerts?page=1&itemsInPage=1', { 'X-API-KEY': key }],
+    ['customers, X-API-KEY', '/api/v3/customers?page=1&itemsInPage=1', { 'X-API-KEY': key }],
+    ['agents, no key at all (control)', '/api/v3/agents?page=1&itemsInPage=1', {}],
+    ['agents, Authorization Bearer', '/api/v3/agents?page=1&itemsInPage=1', { 'Authorization': 'Bearer ' + key }]
+  ];
+  tests.forEach(function (t) {
+    try {
+      var h = t[2];
+      h['Accept'] = 'application/json';
+      var r = UrlFetchApp.fetch(KWD.ATERA_BASE + t[1], { headers: h, muteHttpExceptions: true });
+      var hd = r.getHeaders();
+      Logger.log(t[0] + ' -> HTTP ' + r.getResponseCode() + ' | WWW-Authenticate: ' + (hd['WWW-Authenticate'] || hd['www-authenticate'] || '(none)') +
+        ' | body: ' + r.getContentText().substring(0, 150));
+    } catch (e) { Logger.log(t[0] + ' -> error ' + e.message); }
+  });
+}
+
 function wd_syncDryRun() { kwd_run_(true); }
 function wd_sync() { kwd_run_(false); }
 
